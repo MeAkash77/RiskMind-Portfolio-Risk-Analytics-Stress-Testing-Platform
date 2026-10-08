@@ -1,0 +1,799 @@
+"""Contract tests for ``POST /api/v1/risk/score_from_active``.
+
+Asserts:
+  * Auth required (401 without bearer).
+  * Empty active portfolio → 422 ``no_active_portfolio``.
+  * Market data fully missing → 422 ``no_market_data``.
+  * Happy path: real prices + engine math → ScoreResponse envelope
+    with overall_score and three dimensions.
+
+Mocks the Supabase resolver and the market-data service so the test
+suite stays hermetic + fast."""
+
+from __future__ import annotations
+
+import warnings
+from types import SimpleNamespace
+
+import numpy as np
+import pandas as pd
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def neutral_confirmed_risk_profile(monkeypatch):
+    """Keep route tests offline unless a case explicitly overrides memory."""
+    from backend.app.services import copilot_preferences
+
+    monkeypatch.setattr(
+        copilot_preferences,
+        "get_confirmed_strict",
+        lambda access_token, user_id: None,
+    )
+
+
+@pytest.fixture
+def fake_active_portfolio(monkeypatch):
+    """Patch the atomic active context so
+    score_from_active doesn't hit Supabase."""
+
+    class _Stub:
+        def __init__(self) -> None:
+            self.holdings: dict[str, dict] = {}
+            self.calls: list[str | None] = []
+            self.capital_state = {
+                "cash_balance": 0.0,
+                "margin_loan": 0.0,
+                "contributed_capital": 0.0,
+            }
+
+        def set(self, holdings: dict[str, dict]) -> None:
+            self.holdings = holdings
+
+        def __call__(self, access_token=None):
+            from libs.auth.active_portfolio import ActivePortfolioContext
+
+            self.calls.append(access_token)
+            return ActivePortfolioContext(
+                portfolio_id="p1" if self.holdings else None,
+                holdings=dict(self.holdings),
+                **self.capital_state,
+            )
+
+    stub = _Stub()
+    import libs.auth.active_portfolio as ap
+
+    monkeypatch.setattr(ap, "get_active_portfolio_context", stub)
+    return stub
+
+
+@pytest.fixture
+def fake_capital(fake_active_portfolio):
+    """Patch the token-scoped cash + margin getters so we can drive the
+    leverage/cash math without a real Supabase row. Defaults to a
+    no-margin, no-cash account (scale = 1.0)."""
+
+    return fake_active_portfolio.capital_state
+
+
+@pytest.fixture
+def fake_price_history(monkeypatch):
+    """Patch ``services.market_data.get_price_history``."""
+
+    class _Stub:
+        def __init__(self) -> None:
+            self.frame: pd.DataFrame = pd.DataFrame()
+            self.current_prices: dict[str, float] = {}
+            self.calls: list[list[str]] = []
+            self.raise_on_call: Exception | None = None
+
+        def set(self, frame: pd.DataFrame) -> None:
+            self.frame = frame
+
+        def set_current_prices(self, prices: dict[str, float]) -> None:
+            self.current_prices = prices
+
+        def raise_with(self, exc: Exception) -> None:
+            self.raise_on_call = exc
+
+        def __call__(self, tickers, *, days=365, cache_provider=None, provenance=None):
+            self.calls.append(list(tickers))
+            if self.raise_on_call is not None:
+                raise self.raise_on_call
+            cols = [t for t in tickers if t in self.frame.columns]
+            if provenance is not None:
+                provenance["by_ticker"] = {c: "yfinance" for c in cols}
+                provenance["missing"] = [t for t in tickers if t not in cols]
+            return self.frame[cols] if cols else pd.DataFrame()
+
+        def latest(self, tickers, *, cache_provider=None, provenance=None):
+            rows = []
+            for t in tickers:
+                if t not in self.frame.columns:
+                    continue
+                series = self.frame[t].dropna()
+                if series.empty:
+                    continue
+                rows.append(
+                    SimpleNamespace(
+                        ticker=t,
+                        price=float(self.current_prices.get(t, series.iloc[-1])),
+                        as_of=pd.Timestamp(series.index[-1]).strftime("%Y-%m-%d"),
+                    )
+                )
+            return rows
+
+    stub = _Stub()
+    from backend.app.services import market_data as md
+
+    monkeypatch.setattr(md, "get_price_history", stub)
+    monkeypatch.setattr(md, "get_latest_prices", stub.latest)
+    return stub
+
+
+def _make_history(tickers: list[str], days: int = 260) -> pd.DataFrame:
+    """Deterministic price history — slight upward drift + per-ticker
+    idiosyncratic noise so the scorer has something to work with."""
+    rng = np.random.default_rng(7)
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=days)
+    data: dict[str, np.ndarray] = {}
+    for tk in tickers:
+        # Random walk around 100.
+        returns = rng.normal(0.0003, 0.01, days)
+        levels = 100.0 * np.exp(np.cumsum(returns))
+        data[tk] = levels
+    return pd.DataFrame(data, index=idx)
+
+
+# ── auth gate ──────────────────────────────────────────────────────
+
+
+def test_requires_bearer_token(test_client):
+    resp = test_client.post("/api/v1/risk/score_from_active", json={})
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "unauthorized"
+
+
+# ── empty / missing data paths ─────────────────────────────────────
+
+
+def test_no_active_portfolio_returns_422_with_specific_code(
+    test_client, mint_token, fake_active_portfolio
+):
+    fake_active_portfolio.set({})  # signed-in but no holdings
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "no_active_portfolio"
+
+
+def test_no_market_data_returns_422_with_specific_code(
+    test_client, mint_token, fake_active_portfolio, fake_price_history
+):
+    fake_active_portfolio.set({"SPY": {"shares": 100}})
+    fake_price_history.set(pd.DataFrame())  # empty → no prices
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "no_market_data"
+    assert body["error"]["details"]["tickers"] == ["SPY"]
+
+
+def test_market_data_exception_is_server_error(
+    test_client, mint_token, fake_active_portfolio, fake_price_history
+):
+    fake_active_portfolio.set({"SPY": {"shares": 100}})
+    fake_price_history.raise_with(RuntimeError("yfinance refused"))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "server_error"
+
+
+# ── happy path ─────────────────────────────────────────────────────
+
+
+def test_legacy_asset_type_does_not_500(
+    test_client, mint_token, fake_active_portfolio, fake_price_history
+):
+    """A holding stored with a legacy/unknown asset_type (e.g. 'equity', not in
+    the domain's allowed set) must be normalised to public_security, not 500."""
+    fake_active_portfolio.set(
+        {
+            "SPY": {"shares": 100, "avg_cost": 400.0, "asset_type": "equity"},
+            "AAPL": {"shares": 10, "avg_cost": 150.0, "asset_type": "stock"},
+        }
+    )
+    fake_price_history.set(_make_history(["AAPL", "SPY"]))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert isinstance(resp.json()["data"]["overall_score"], int)
+
+
+def test_omitted_preference_uses_confirmed_profile(
+    test_client,
+    mint_token,
+    fake_active_portfolio,
+    fake_price_history,
+    monkeypatch,
+):
+    from backend.app.services import copilot_preferences
+
+    monkeypatch.setattr(
+        copilot_preferences,
+        "get_confirmed_strict",
+        lambda *_: {"risk_tolerance": 2, "confirmed_at": "2026-07-21T00:00:00Z"},
+    )
+    fake_active_portfolio.set({"SPY": {"shares": 100, "avg_cost": 400.0}})
+    fake_price_history.set(_make_history(["SPY"]))
+
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()["data"]
+    assert data["risk_preference"] == 2
+    assert data["risk_preference_source"] == "confirmed"
+
+
+def test_happy_path_returns_complete_score_envelope(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    fake_capital["cash_balance"] = 1000.0
+    fake_capital["margin_loan"] = 250.0
+    fake_capital["contributed_capital"] = 40000.0
+    fake_active_portfolio.set(
+        {
+            "SPY": {"shares": 100, "avg_cost": 400.0},
+            "BND": {"shares": 50, "avg_cost": 70.0},
+        }
+    )
+    fake_price_history.set(_make_history(["BND", "SPY"]))
+
+    token = mint_token(sub="user-real-data")
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={"risk_preference": 3, "risk_free_rate": 0.045},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()["data"]
+    assert isinstance(data["overall_score"], int)
+    assert 0 <= data["overall_score"] <= 1000
+    assert data["risk_preference_source"] == "request_override"
+    assert data["risk_fit"]["status"] in {"above", "aligned", "below", "unavailable"}
+    assert set(data["dimensions"].keys()) == {
+        "risk_match",
+        "risk_adjusted_return",
+        "downside_protection",
+    }
+    # Real prices were used — no synthetic-data warning in the notes.
+    notes = data["metrics"]["data_quality_notes"]
+    assert not any("synthesised" in n for n in notes)
+
+    latest_equity = 100 * float(fake_price_history.frame["SPY"].dropna().iloc[-1]) + 50 * float(
+        fake_price_history.frame["BND"].dropna().iloc[-1]
+    )
+    previous_equity = 100 * float(fake_price_history.frame["SPY"].dropna().iloc[-2]) + 50 * float(
+        fake_price_history.frame["BND"].dropna().iloc[-2]
+    )
+    expected_net = latest_equity + 1000.0 - 250.0
+    expected_daily_pnl = latest_equity - previous_equity
+    expected_daily_return = expected_daily_pnl / (previous_equity + 1000.0 - 250.0)
+    assert data["metrics"]["total_value"] == pytest.approx(latest_equity + 1000.0, abs=0.01)
+    assert data["metrics"]["net_equity"] == pytest.approx(expected_net, abs=0.01)
+    assert data["metrics"]["daily_pnl"] == pytest.approx(expected_daily_pnl, abs=0.01)
+    assert data["metrics"]["daily_return"] == pytest.approx(expected_daily_return)
+    assert data["metrics"]["total_pnl"] == pytest.approx(expected_net - 40000.0, abs=0.01)
+    assert data["metrics"]["total_return"] == pytest.approx((expected_net - 40000.0) / 40000.0)
+
+    # The caller's JWT was forwarded to the active-portfolio resolver
+    # so Supabase RLS applied. Same security contract as /portfolios/me.
+    assert fake_active_portfolio.calls == [token]
+
+
+def test_account_value_metrics_use_current_prices_for_today_pnl():
+    """Daily P&L must use the current/last price vs previous close, not the
+    stale daily close that backs the risk engine."""
+    from backend.app.api.v1.risk import _account_value_metrics
+
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=2)
+    price_frame = pd.DataFrame({"SPY": [100.0, 110.0]}, index=idx)
+    metrics = _account_value_metrics(
+        holdings={"SPY": {"shares": 10}},
+        price_frame=price_frame,
+        cash_balance=0.0,
+        margin_loan=0.0,
+        contributed_capital=1000.0,
+        current_prices={"SPY": 95.0},
+    )
+
+    assert metrics["total_value"] == pytest.approx(950.0)
+    assert metrics["daily_pnl"] == pytest.approx(-50.0)
+    assert metrics["daily_return"] == pytest.approx(-50.0 / 1000.0)
+
+
+def test_account_value_metrics_do_not_turn_new_positions_into_daily_pnl():
+    """Positions without a prior close should contribute to current value, but
+    not become artificial day-over-day gains."""
+    from backend.app.api.v1.risk import _account_value_metrics
+
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=2)
+    price_frame = pd.DataFrame(
+        {
+            "SPY": [100.0, 110.0],
+            "NEW": [None, 50.0],
+        },
+        index=idx,
+    )
+    metrics = _account_value_metrics(
+        holdings={"SPY": {"shares": 10}, "NEW": {"shares": 10}},
+        price_frame=price_frame,
+        cash_balance=0.0,
+        margin_loan=0.0,
+        contributed_capital=1000.0,
+    )
+
+    assert metrics["total_value"] == pytest.approx(1600.0)
+    assert metrics["daily_pnl"] == pytest.approx(100.0)
+    assert metrics["daily_return"] == pytest.approx(100.0 / 1500.0)
+    assert metrics["total_pnl"] == pytest.approx(600.0)
+
+
+def test_account_value_metrics_include_signed_option_liquidation_value_once():
+    """Long option assets and short option liabilities belong in net equity,
+    but without prior option marks they must not be invented as today's P&L."""
+    from backend.app.api.v1.risk import _account_value_metrics
+
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=2)
+    price_frame = pd.DataFrame({"SPY": [100.0, 101.0]}, index=idx)
+    metrics = _account_value_metrics(
+        holdings={"SPY": {"shares": 10}},
+        price_frame=price_frame,
+        cash_balance=500.0,
+        margin_loan=100.0,
+        contributed_capital=1200.0,
+        option_market_value=450.0,  # e.g. long spread mark net of its short leg
+    )
+
+    assert metrics["total_value"] == 1960.0
+    assert metrics["net_equity"] == 1860.0
+    assert metrics["total_pnl"] == 660.0
+    assert metrics["daily_pnl"] == 10.0  # equities only until prior option marks exist
+
+
+def test_malformed_option_row_prevents_false_complete_account_value():
+    """An option row missing contract identity must not disappear from the
+    completeness denominator and make the account balance look comparable."""
+    from backend.app.api.v1.risk import _complete_option_market_value
+
+    holdings = {
+        "AAPL270115C00150000": {
+            "asset_type": "option",
+            "shares": 1,
+            "underlying": "AAPL",
+            # strike/expiry intentionally missing
+        }
+    }
+    assert _complete_option_market_value(holdings, []) is None
+
+
+def _run_score(test_client, token, fake_active_portfolio, fake_price_history, holdings):
+    fake_active_portfolio.set(holdings)
+    fake_price_history.set(_make_history(sorted(holdings.keys())))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={"risk_preference": 3, "risk_free_rate": 0.045},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    return resp.json()["data"]
+
+
+def test_margin_amplifies_risk_in_score(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    """A margin loan levers the book. The same holdings with a loan must
+    report higher daily VaR than the unlevered version, and flag the
+    leverage in the data-quality notes."""
+    holdings = {"SPY": {"shares": 100, "avg_cost": 400.0}}
+    token = mint_token(sub="user-lev")
+
+    fake_capital["cash_balance"] = 0.0
+    fake_capital["margin_loan"] = 0.0
+    base = _run_score(test_client, token, fake_active_portfolio, fake_price_history, holdings)
+
+    # ~50% loan against the equity → leverage ≈ 2× (gross/net).
+    fake_capital["margin_loan"] = 0.5 * 100 * 100.0  # shares×~price (history ~100)
+    levered = _run_score(test_client, token, fake_active_portfolio, fake_price_history, holdings)
+
+    base_var = base["metrics"]["var_95_daily"]
+    lev_var = levered["metrics"]["var_95_daily"]
+    assert base_var is not None and lev_var is not None
+    assert lev_var > base_var * 1.5  # leverage clearly amplified VaR
+    assert any("everage" in n for n in levered["metrics"]["data_quality_notes"])
+
+
+def test_cash_drag_lowers_risk_in_score(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    """Idle cash dilutes a pure-equity book: same holdings + a cash
+    balance must report lower daily VaR (cash is ~risk-free)."""
+    holdings = {"SPY": {"shares": 100, "avg_cost": 400.0}}
+    token = mint_token(sub="user-cash")
+
+    fake_capital["cash_balance"] = 0.0
+    fake_capital["margin_loan"] = 0.0
+    base = _run_score(test_client, token, fake_active_portfolio, fake_price_history, holdings)
+
+    # Add cash roughly equal to the equity → ~half the book is risk-free.
+    fake_capital["cash_balance"] = 100 * 100.0
+    with_cash = _run_score(test_client, token, fake_active_portfolio, fake_price_history, holdings)
+
+    assert with_cash["metrics"]["var_95_daily"] < base["metrics"]["var_95_daily"]
+    # cash_weight should now be a meaningful fraction of the book.
+    assert with_cash["metrics"]["cash_weight"] > 0.3
+
+
+def test_sgov_margin_offset_is_explained_without_changing_score_math(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    """SGOV remains a priced security in the score, while the additive
+    financing block shows that selling it could retire an equal margin loan."""
+    holdings = {
+        "SPY": {"shares": 100, "avg_cost": 90.0},
+        "SGOV": {"shares": 50, "avg_cost": 99.0},
+    }
+    history = _make_history(["SGOV", "SPY"])
+    fake_active_portfolio.set(holdings)
+    fake_price_history.set(history)
+    fake_capital["margin_loan"] = 50 * float(history["SGOV"].iloc[-1])
+
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token(sub='sgov-offset')}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()["data"]
+    financing = data["financing_resilience"]
+    assert financing["status"] == "covered"
+    assert financing["margin_coverage_ratio"] == pytest.approx(1.0)
+    assert financing["residual_margin"] == pytest.approx(0.0)
+    assert financing["post_offset_risk_leverage"] == pytest.approx(1.0, rel=1e-5)
+    assert financing["cash_equivalents"][0]["ticker"] == "SGOV"
+    # The security was not converted into the engine's constant-return CASH leg.
+    assert data["metrics"]["cash_weight"] == pytest.approx(0.0)
+
+
+def test_liquidity_class_override_does_not_move_the_score(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    """The invariant the feature rests on, asserted directly.
+
+    Toggling ``liquidity_class`` changes only the financing explanation. The
+    same holdings and prices must produce a byte-identical score — cash_weight
+    was only ever a proxy for this.
+    """
+    history = _make_history(["SGOV", "SPY"])
+    fake_price_history.set(history)
+    fake_capital["margin_loan"] = 50 * float(history["SGOV"].iloc[-1])
+
+    def _score(sgov_meta: dict) -> dict:
+        fake_active_portfolio.set(
+            {
+                "SPY": {"shares": 100, "avg_cost": 90.0},
+                "SGOV": {"shares": 50, "avg_cost": 99.0, **sgov_meta},
+            }
+        )
+        resp = test_client.post(
+            "/api/v1/risk/score_from_active",
+            json={},
+            headers={"Authorization": f"Bearer {mint_token(sub='liq-invariance')}"},
+        )
+        assert resp.status_code == 200, resp.json()
+        return resp.json()["data"]
+
+    auto = _score({})
+    as_risk_asset = _score({"liquidity_class": "risk_asset"})
+
+    assert auto["overall_score"] == as_risk_asset["overall_score"]
+    assert auto["score_version"] == as_risk_asset["score_version"]
+    assert auto["dimensions"] == as_risk_asset["dimensions"]
+    # ...while the financing explanation DOES differ, which is the whole point.
+    assert auto["financing_resilience"]["status"] == "covered"
+    assert as_risk_asset["financing_resilience"]["status"] == "uncovered"
+
+
+def test_missing_avg_cost_scores_without_fabricating_pnl(
+    test_client, mint_token, fake_active_portfolio, fake_price_history
+):
+    """A holding with no avg_cost must still score cleanly — the missing
+    cost basis becomes UNKNOWN (None) at the boundary, not a fake 0 that
+    would imply 100% profit. The score itself doesn't depend on cost
+    basis, so this just proves the None path doesn't crash."""
+    fake_active_portfolio.set({"SPY": {"shares": 100}})  # no avg_cost
+    fake_price_history.set(_make_history(["SPY"]))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert 0 <= resp.json()["data"]["overall_score"] <= 1000
+
+
+def test_drops_zero_share_holdings_silently(
+    test_client, mint_token, fake_active_portfolio, fake_price_history
+):
+    """A user can keep a 0-share row as a watchlist marker. The
+    scorer shouldn't crash — it just skips the row. If every row is
+    0-share we surface the specific 422."""
+    fake_active_portfolio.set(
+        {
+            "SPY": {"shares": 0},
+            "BND": {"shares": 0},
+        }
+    )
+    fake_price_history.set(_make_history(["BND", "SPY"]))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "no_priced_holdings"
+
+
+def _arm_short_call_option_book(monkeypatch, fake_active_portfolio, fake_price_history):
+    """Arm a book with an uncovered short AAPL call + a SPY equity leg (the
+    fixture setup shared by the option-penalty tests)."""
+    import backend.app.services.options_analytics as oa
+
+    monkeypatch.setattr(
+        oa,
+        "analyze_contracts",
+        lambda specs, **k: {
+            "results": [
+                {
+                    "underlying": "AAPL",
+                    "option_type": "call",
+                    "strike": 100.0,
+                    "expiry": "2027-06-18",
+                    "quantity": -1.0,  # short call
+                    "contract_multiplier": 100.0,
+                    "days_to_expiry": 300,
+                    "spot": 100.0,
+                    "mark": 10.0,
+                    "iv": 0.3,
+                    "greeks": {
+                        "delta": 0.6,
+                        "gamma": 0.02,
+                        "theta": -0.05,
+                        "vega": 0.15,
+                        "rho": 0.1,
+                    },
+                    "delta_notional": -6000.0,
+                    "market_value": -1000.0,
+                    "moneyness": "ATM",
+                    "warnings": [],
+                }
+            ]
+        },
+    )
+    fake_active_portfolio.set(
+        {
+            "SPY": {"shares": 100, "avg_cost": 400.0},
+            "AAPL270618C00100000": {
+                "shares": 1,
+                "asset_type": "option",
+                "option_type": "call",
+                "option_side": "short",
+                "underlying": "AAPL",
+                "strike": 100,
+                "expiry": "2027-06-18",
+            },
+        }
+    )
+    fake_price_history.set(_make_history(["SPY", "AAPL"]))
+
+
+def test_option_holding_penalizes_score_and_surfaces_impact(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital, monkeypatch
+):
+    """An uncovered short call deterministically deducts from the score and the
+    `options` impact block is surfaced (base − penalty + breakdown)."""
+    _arm_short_call_option_book(monkeypatch, fake_active_portfolio, fake_price_history)
+
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    opt = data["options"]
+    assert opt is not None
+    assert opt["contracts"] == 1
+    assert opt["penalty"] > 0  # short gamma + uncovered short call
+    assert any(f["code"] == "uncovered_short_call" for f in opt["flags"])
+    # overall_score = base_score − penalty (transparent, capped).
+    assert data["overall_score"] == max(0, opt["base_score"] - opt["penalty"])
+
+
+def test_no_options_no_impact_block(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    fake_active_portfolio.set({"SPY": {"shares": 100, "avg_cost": 400.0}})
+    fake_price_history.set(_make_history(["SPY"]))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["options"] is None  # equity-only → no options block
+
+
+def test_option_score_path_emits_no_pydantic_serialization_warning(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital, monkeypatch
+):
+    """Contract guard: the option-penalty path must NOT emit
+    `PydanticSerializationUnexpectedValue`. The `options` block is validated into
+    `OptionScoreImpactOut` before it enters `ScoreResponse` (model_copy does not
+    validate), so the envelope serializer sees a typed value, not a raw dict.
+    Runs the warning-emitting filter as an error so a regression fails CI."""
+    _arm_short_call_option_book(monkeypatch, fake_active_portfolio, fake_price_history)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        resp = test_client.post(
+            "/api/v1/risk/score_from_active",
+            json={},
+            headers={"Authorization": f"Bearer {mint_token()}"},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["data"]["options"] is not None  # the path under guard ran
+    offenders = [
+        str(w.message)
+        for w in caught
+        if "PydanticSerializationUnexpectedValue" in str(w.message)
+        or "Pydantic serializer warnings" in str(w.message)
+    ]
+    assert not offenders, f"unexpected Pydantic serialization warning(s): {offenders}"
+
+
+def test_score_surfaces_concentration_of_the_equity_book(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    # A dominant single name (≈80% by share count, equal-ish prices) must show
+    # up in the score's concentration block so /score can say "what's dragging it".
+    fake_active_portfolio.set(
+        {
+            "NVDA": {"shares": 800, "avg_cost": 100.0},
+            "SPY": {"shares": 200, "avg_cost": 100.0},
+        }
+    )
+    fake_price_history.set(_make_history(["NVDA", "SPY"]))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    conc = resp.json()["data"]["concentration"]
+    assert conc is not None
+    assert conc["num_holdings"] == 2
+    assert conc["top_holding_ticker"] == "NVDA"
+    assert conc["top_holding_weight"] > 0.7  # dominant
+    assert conc["top5_weight"] == pytest.approx(1.0, abs=1e-6)  # only 2 names
+    assert conc["effective_holdings"] is not None
+    assert conc["sectors"]  # deterministic sector roll-up present
+
+
+def test_simulate_actions_returns_levered_cards_with_expected_deltas(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital
+):
+    """Upgraded Action Cards: a concentrated + levered book yields deterministic
+    risk levers, each with an EXPECTED score delta re-scored on the same returns,
+    trade-offs, assumptions, and a simulate_holdings payload that never adds a
+    new security."""
+    fake_capital["cash_balance"] = 0.0
+    fake_capital["margin_loan"] = 30000.0  # → leverage ~1.43
+    fake_capital["contributed_capital"] = 40000.0
+    fake_active_portfolio.set(
+        {"AAA": {"shares": 900, "avg_cost": 100.0}, "BBB": {"shares": 100, "avg_cost": 100.0}}
+    )
+    fake_price_history.set(_make_history(["AAA", "BBB"]))
+
+    token = mint_token(sub="user-actions")
+    resp = test_client.post(
+        "/api/v1/risk/simulate_actions",
+        json={"risk_preference": 3, "risk_free_rate": 0.045},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()["data"]
+
+    assert isinstance(data["baseline_score"], int) and 0 <= data["baseline_score"] <= 1000
+    cards = {c["key"]: c for c in data["actions"]}
+    # concentrated (AAA ~90%) + levered book → at least concentration + deleverage
+    assert "reduce_concentration" in cards
+    assert "reduce_leverage" in cards
+
+    original = {"AAA", "BBB", "CASH"}
+    for c in data["actions"]:
+        assert c["trade_offs"] and c["assumptions"]
+        assert c["disclaimer"] and "not financial advice" in c["disclaimer"].lower()
+        assert c["simulate_holdings"]
+        # never introduces a new security (only trims the user's own book / cash)
+        assert {h["ticker"] for h in c["simulate_holdings"]} <= original
+        assert isinstance(c["expected_score_delta"], int)  # re-scored, not None
+
+    # the concentration lever caps AAA at 25% of the WHOLE portfolio, holding cash
+    conc = cards["reduce_concentration"]
+    sim = {h["ticker"]: h["market_value"] for h in conc["simulate_holdings"]}
+    assert "CASH" in sim and sim["CASH"] > 0
+    gross = sum(sim.values())  # equity + cash
+    assert sim["AAA"] / gross == pytest.approx(0.25, abs=0.001)
+
+
+def test_simulate_actions_is_auth_gated(test_client):
+    resp = test_client.post("/api/v1/risk/simulate_actions", json={})
+    assert resp.status_code == 401
+
+
+def test_successful_score_does_not_claim_the_score_was_reviewed(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_capital, monkeypatch
+):
+    """Background calculation is not the user-review milestone."""
+    from backend.app.services import user_journey as uj
+
+    uj.reset_stamp_memo()
+    stamped: list[tuple[str, str]] = []
+    monkeypatch.setattr(uj, "record_milestone", lambda t, u, m: stamped.append((u, m)) or {})
+
+    fake_active_portfolio.set({"SPY": {"shares": 100, "avg_cost": 400.0}})
+    fake_price_history.set(_make_history(["SPY"]))
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={"risk_preference": 3},
+        headers={"Authorization": f"Bearer {mint_token(sub='user-journey-score')}"},
+    )
+    assert resp.status_code == 200, resp.json()
+    assert ("user-journey-score", "first_score_at") not in stamped
+
+
+def test_failed_score_never_stamps_the_milestone(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, monkeypatch
+):
+    from backend.app.services import user_journey as uj
+
+    uj.reset_stamp_memo()
+    stamped: list[tuple[str, str]] = []
+    monkeypatch.setattr(uj, "record_milestone", lambda t, u, m: stamped.append((u, m)) or {})
+
+    fake_active_portfolio.set({})  # no active holdings → 422
+    resp = test_client.post(
+        "/api/v1/risk/score_from_active",
+        json={"risk_preference": 3},
+        headers={"Authorization": f"Bearer {mint_token()}"},
+    )
+    assert resp.status_code == 422
+    assert stamped == []

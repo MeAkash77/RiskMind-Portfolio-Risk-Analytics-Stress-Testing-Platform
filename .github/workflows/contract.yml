@@ -1,0 +1,70 @@
+# FastAPI → OpenAPI → TypeScript contract-drift gate.
+#
+# Regenerates the committed `openapi.json` (from the FastAPI app) and
+# `frontend/src/lib/api-types.ts` (from that json, offline), then fails if
+# either differs from what's committed — i.e. someone changed the backend
+# contract without running `scripts/export_openapi.py` + `npm run gen:api`.
+#
+# The codegen toolchain is byte-deterministic because requirements.txt +
+# backend/requirements-backend.txt now pin fastapi/starlette/pydantic EXACTLY
+# (== the runtime AND the versions that produced the committed artifacts), so
+# this job just installs the app deps — no separate override to drift.
+# openapi-typescript is pinned via frontend/package-lock.json. Bump the pins +
+# regenerate the artifacts together.
+#
+# This workflow IS committed (the pushing account has the `workflow` scope). The
+# version-stable structural guard in `backend/tests/test_openapi_contract.py`
+# also runs in the backend-tests job as a fast pre-check.
+
+name: contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  openapi-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install app deps (exact-pinned = deterministic codegen)
+        run: |
+          python -m pip install --upgrade pip
+          # requirements now pin fastapi==0.139.0 / starlette==1.3.1 /
+          # pydantic==2.12.5 (→ pydantic-core==2.41.5) EXACTLY, and that's the
+          # SAME toolchain that produced the committed openapi.json /
+          # api-types.ts. So the app deps ARE the codegen toolchain — no
+          # separate override to drift out of sync.
+          pip install -r requirements.txt -r backend/requirements-backend.txt
+
+      - name: Regenerate openapi.json
+        run: python scripts/export_openapi.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Regenerate api-types.ts (offline, from committed openapi.json)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run gen:api
+
+      - name: Fail on contract drift
+        run: |
+          if ! git diff --exit-code openapi.json frontend/src/lib/api-types.ts; then
+            echo "::error::OpenAPI contract drift. Run 'python scripts/export_openapi.py' then 'cd frontend && npm run gen:api' and commit the result."
+            exit 1
+          fi
+          echo "OpenAPI contract is in sync."

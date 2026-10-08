@@ -1,0 +1,588 @@
+"""``/api/v1/research/*`` — Ticker Research 2.0 (FactPack + Verdict).
+
+Two stages, mirroring the equity endpoints but built on the compact, source-
+attributed FactPack instead of the raw dossier:
+
+* ``GET /research/fact_pack/{ticker}`` — authed, NO credit. Deterministic
+  provider+free composition (valuation band, CAGR, drivers, risk flags,
+  provenance). Paints the research cockpit instantly.
+* ``POST /research/verdict`` — authed + **credit-gated**. The LLM ranks/explains
+  over the FactPack the client passes back (no second fetch). Degrades to the
+  deterministic verdict with no LLM key. Full AI telemetry recorded post-call.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+
+from fastapi import APIRouter, Depends, Path, Query, Request
+
+from ...core.deps_auth import AuthedUser, require_user
+from ...core.responses import forbidden, ok, too_many_requests, unprocessable
+from ...schemas.envelope import Envelope
+from ...schemas.news import TickerNewsResponse
+from ...schemas.research import FactPack, VerdictRequest
+from ...schemas.research_coverage import ResearchCoverageOut
+from ...schemas.valuation import DCFRequest
+from ...services import news as news_svc
+from ...services import research_dcf as rdcf
+from ...services import research_earnings as rearn
+from ...services import research_factpack as rf
+from ...services import research_financials as rfin
+from ...services import research_peers as rpeers
+from ...services import research_report as rreport
+from ...services import research_thesis as rthesis
+from ...services._common import iso_now, safe
+
+router = APIRouter(prefix="/api/v1/research", tags=["research"])
+
+_log = logging.getLogger(__name__)
+_VERDICT_MODEL = "claude-sonnet-4-6"
+
+
+@router.get(
+    "/fact_pack/{ticker}",
+    summary="Compact, source-attributed FactPack for a ticker (no credit)",
+    response_model=Envelope[dict],
+)
+def fact_pack(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    started = time.perf_counter()
+    try:
+        fp = rf.build_fact_pack_cached(ticker)
+    except ValueError as exc:
+        raise unprocessable(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - fetch/compose failure
+        _log.warning("research.factpack.failed ticker=%s err=%s", ticker, type(exc).__name__)
+        raise unprocessable(f"Could not build a FactPack for {ticker!r}.") from exc
+
+    return ok({"fact_pack": fp.model_dump()}, request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/coverage",
+    summary="Data-coverage matrix: which datasets back this ticker, freshness, typed missing reasons",
+    response_model=Envelope[ResearchCoverageOut],
+)
+def research_coverage(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Phase 5: ONE normalized coverage matrix assembled from the SAME cached
+    builders the page already triggers — per-dataset source tier / as-of /
+    staleness / typed missing reason, core fields graded critical, and the
+    shared DataConfidence enforcement block (thin critical coverage caps
+    conviction exactly like every other surface). Fail-soft: a dead provider
+    yields missing rows, never a 500."""
+    started = time.perf_counter()
+    from ...services.research_coverage import build_coverage
+
+    out = build_coverage(ticker)
+    return ok(out.model_dump(), request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/fact-pack",
+    summary="Institutional research FactPack: financials + deterministic trends (no credit)",
+    response_model=Envelope[dict],
+)
+def research_fact_pack(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Phase 1 institutional FactPack: company snapshot + up to 8 quarters & 5
+    fiscal years of financials + a deterministic trend summary (margins, YoY/QoQ,
+    TTM, acceleration flags), with explicit provenance, missing-data, and a
+    confidence score. Every number is computed in backend code — no LLM. Builds
+    fail-soft (partial pack on provider failure), so this raises only on an
+    unexpected internal error."""
+    started = time.perf_counter()
+    try:
+        pack = rfin.build_research_fact_pack(ticker)
+    except Exception as exc:  # noqa: BLE001 - builder is fail-soft; this is a backstop
+        _log.warning(
+            "research.research_factpack.failed ticker=%s err=%s", ticker, type(exc).__name__
+        )
+        raise unprocessable(f"Could not build a research FactPack for {ticker!r}.") from exc
+    return ok({"fact_pack": pack.model_dump()}, request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/diagnostics",
+    summary="Research data-coverage diagnostics for a ticker (owner): why is it blank?",
+    response_model=Envelope[dict],
+)
+def research_diagnostics(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Owner-only. Explains WHY a ticker's research is thin: which provider served
+    the financial statements, how many annual/quarterly rows came back, per-block
+    coverage, the FMP key's PRESENCE (a boolean — never the value), and the
+    missing datasets + provider warnings. For debugging blank research pages.
+    Never prints any secret."""
+    from libs.admin.status import is_owner_email
+
+    if not is_owner_email(user.email):
+        raise forbidden("Owner only.")
+
+    started = time.perf_counter()
+    tk = ticker.strip().upper()
+
+    from ...core.config import get_settings
+    from ...services.providers import fmp_provider as fpp
+
+    fmp_key_present = bool(getattr(get_settings(), "fmp_api_key", ""))
+    ann = fpp.get_financial_statements(tk, period="annual", limit=5)
+    qtr = fpp.get_financial_statements(tk, period="quarter", limit=8)
+    prof = fpp.get_profile(tk)
+    peers = fpp.get_peers(tk)
+    earn = fpp.get_earnings(tk, limit=8)
+
+    missing: list[str] = []
+    if not ann.data:
+        missing.append("income_annual")
+    if not qtr.data:
+        missing.append("income_quarterly")
+    if not getattr(prof, "data", None):
+        missing.append("profile")
+    if not peers.data:
+        missing.append("peers")
+    if not earn.data:
+        missing.append("earnings_estimates")
+
+    warnings = sorted(
+        {
+            *(ann.warnings or []),
+            *(qtr.warnings or []),
+            *(prof.warnings or []),
+            *(peers.warnings or []),
+            *(earn.warnings or []),
+        }
+    )
+
+    payload = {
+        "ticker": tk,
+        "fmp_key_present": fmp_key_present,  # boolean only — never the key value
+        "statements_provider": (ann.source if ann.data else (qtr.source if qtr.data else None)),
+        "annual_rows": len(ann.data or []),
+        "quarterly_rows": len(qtr.data or []),
+        "annual_coverage": round(ann.coverage, 3) if ann.data else 0.0,
+        "profile_coverage": round(prof.coverage, 3) if getattr(prof, "data", None) else 0.0,
+        "peer_count": len(peers.data or []),
+        "earnings_coverage": round(earn.coverage, 3) if earn.data else 0.0,
+        "missing_datasets": missing,
+        "warnings": warnings,
+        "fetched_at": iso_now(),
+    }
+    return ok(payload, request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/bundle",
+    summary="Consolidated research bundle — one fetch for the whole page (no credit)",
+    response_model=Envelope[dict],
+)
+def research_bundle(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Everything the consolidated research page needs, assembled in ONE request
+    so a ticker search fans out to the providers ONCE (the engines share the
+    in-process FMP cache within the call) instead of one fan-out per tab: compact
+    FactPack + institutional financials + DCF + peers + earnings + a deterministic
+    thesis + news. Each block is fail-soft (a failing engine becomes ``null``,
+    never a 500). All numbers are deterministic — no credit, no LLM here; the AI
+    summary is a separate on-demand upgrade (``POST /research/{ticker}/thesis``)."""
+    started = time.perf_counter()
+    tk = ticker.strip().upper()
+
+    fp = safe("research.bundle.factpack", lambda: rf.build_fact_pack_cached(tk))
+    fin = safe("research.bundle.financials", lambda: rfin.build_research_fact_pack(tk))
+    dcf = safe("research.bundle.dcf", lambda: rdcf.build_dcf(tk))
+    peers = safe("research.bundle.peers", lambda: rpeers.build_peer_comparison(tk))
+    earn = safe("research.bundle.earnings", lambda: rearn.build_earnings_comparison(tk))
+    # Reuses the fp/dcf/earn already built above (no duplicate engine pass).
+    thesis = safe(
+        "research.bundle.thesis",
+        lambda: rthesis.build_thesis(tk, llm_callable=None, fp=fp, dcf=dcf, earn=earn),
+    )
+    news = safe(
+        "research.bundle.news",
+        lambda: TickerNewsResponse.model_validate(news_svc.get_ticker_news(tk)).model_dump(),
+    )
+
+    def _dump(x):
+        return x.model_dump() if x is not None else None
+
+    _record_bundle_dataset_health(
+        fp=fp, fin=fin, dcf=dcf, peers=peers, earn=earn, thesis=thesis, news=news
+    )
+
+    bundle = {
+        "ticker": tk,
+        "generated_at": iso_now(),
+        "as_of": getattr(fin, "as_of", None) or getattr(earn, "as_of", None),
+        "data_confidence": getattr(fin, "data_confidence", None),
+        "confidence_label": getattr(fin, "confidence_label", None),
+        "fact_pack": _dump(fp),
+        "financials": _dump(fin),
+        "dcf": _dump(dcf),
+        "peers": _dump(peers),
+        "earnings": _dump(earn),
+        "thesis": _dump(thesis),
+        "news": news,
+    }
+    return ok({"bundle": bundle}, request=request, started_at=started)
+
+
+def _record_bundle_dataset_health(*, fp, fin, dcf, peers, earn, thesis, news) -> None:
+    """Aggregate per-DATASET health counters for the owner dashboard — request /
+    present / empty / stale / fallback / provider_error / rate_limited. NEVER
+    records the ticker, the user, or any content; distinguishes provider-reality
+    gaps (empty, rate_limited) from code faults (provider_error, i.e. the
+    ``safe()`` leg raised). Fail-soft: metrics must never break the bundle."""
+    from ...services import metrics
+
+    def _warnings_of(x) -> str:
+        try:
+            dq = getattr(x, "data_quality", None)
+            ws = list(getattr(dq, "warnings", None) or [])
+            ws += [getattr(m, "reason", "") or "" for m in (getattr(x, "missing_data", None) or [])]
+            return " ".join(str(w) for w in ws).lower()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _classify(name: str, result, present: bool, *, stale=False, fallback=False) -> None:
+        if result is None:
+            # safe() swallowed an exception → the leg itself failed.
+            metrics.record_dataset(name, "provider_error")
+            return
+        outcomes = ["present" if present else "empty"]
+        blob = _warnings_of(result)
+        if "rate_limit" in blob or "429" in blob:
+            outcomes.append("rate_limited")
+        if stale:
+            outcomes.append("stale")
+        if fallback:
+            outcomes.append("fallback")
+        metrics.record_dataset(name, *outcomes)
+
+    try:
+        _classify(
+            "factpack",
+            fp,
+            fp is not None and getattr(fp, "price", None) is not None,
+            stale=bool(getattr(getattr(fp, "cache", None), "stale", False)),
+            fallback=any(
+                getattr(s, "source", "") == "yfinance"
+                for s in (getattr(getattr(fp, "data_quality", None), "sources", None) or [])
+            ),
+        )
+        _classify(
+            "financials",
+            fin,
+            bool(getattr(fin, "quarters", None) or getattr(fin, "annuals", None)),
+            fallback=any(
+                "yfinance" in str(getattr(p, "source", "")).lower()
+                for p in (getattr(fin, "provenance", None) or [])
+            ),
+        )
+        _classify("dcf", dcf, bool(getattr(dcf, "valid", False)))
+        # rows[0] is the subject itself — "present" means actual PEERS came back.
+        _classify("peers", peers, len(getattr(peers, "rows", None) or []) > 1)
+        _classify(
+            "earnings",
+            earn,
+            bool(getattr(earn, "quarters", None)),
+            fallback="yfinance" in str(getattr(earn, "source", "")).lower(),
+        )
+        _classify("thesis", thesis, thesis is not None)
+        _classify(
+            "news",
+            news,
+            bool((news or {}).get("items") if isinstance(news, dict) else False),
+        )
+    except Exception:  # noqa: BLE001 — health counters are an annotation
+        _log.warning("research.bundle.dataset_health_failed")
+
+
+@router.post(
+    "/{ticker}/dcf",
+    summary="Deterministic DCF valuation (accepts user overrides; no credit)",
+    response_model=Envelope[dict],
+)
+def dcf_valuation(
+    body: DCFRequest,
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Deterministic DCF — assumptions derived from reported financials (each
+    labeled with its source_type) + optional user overrides. Returns the full
+    DCFValuationOutput; an invalid setup (e.g. terminal growth ≥ WACC, or
+    insufficient data) comes back with `valid=false` + warnings rather than a
+    bogus number. No LLM, no credit, fail-soft."""
+    started = time.perf_counter()
+    try:
+        out = rdcf.build_dcf(ticker, body.overrides if body else None)
+    except Exception as exc:  # noqa: BLE001 - builder is fail-soft; backstop
+        _log.warning("research.dcf.failed ticker=%s err=%s", ticker, type(exc).__name__)
+        raise unprocessable(f"Could not build a DCF for {ticker!r}.") from exc
+    return ok({"dcf": out.model_dump()}, request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/peers",
+    summary="Deterministic peer comparison with percentiles (no credit)",
+    response_model=Envelope[dict],
+)
+def peer_comparison(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    peers: str | None = Query(default=None, description="Optional comma-separated user peers"),
+    user: AuthedUser = Depends(require_user),
+):
+    """Deterministic peer set (FMP peers → sector/industry → curated → user) with
+    per-metric peer median + the subject's percentile rank, missing-data flags,
+    and provenance. No LLM, no credit, fail-soft."""
+    started = time.perf_counter()
+    user_peers = [p.strip().upper() for p in peers.split(",") if p.strip()] if peers else None
+    try:
+        out = rpeers.build_peer_comparison(ticker, user_peers=user_peers)
+    except Exception as exc:  # noqa: BLE001 - fail-soft backstop
+        _log.warning("research.peers.failed ticker=%s err=%s", ticker, type(exc).__name__)
+        raise unprocessable(f"Could not build a peer comparison for {ticker!r}.") from exc
+    return ok({"peers": out.model_dump()}, request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/earnings",
+    summary="Deterministic earnings comparison + transcript metadata (no credit)",
+    response_model=Envelope[dict],
+)
+def earnings_comparison(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Recent quarters: revenue/EPS vs prior-quarter / prior-year, beat/miss vs
+    estimate ONLY when estimate data exists, plus transcript metadata. Missing
+    estimates/transcript are explicit. No LLM, no credit, fail-soft."""
+    started = time.perf_counter()
+    try:
+        out = rearn.build_earnings_comparison(ticker)
+    except Exception as exc:  # noqa: BLE001 - fail-soft backstop
+        _log.warning("research.earnings.failed ticker=%s err=%s", ticker, type(exc).__name__)
+        raise unprocessable(f"Could not build an earnings comparison for {ticker!r}.") from exc
+    return ok({"earnings": out.model_dump()}, request=request, started_at=started)
+
+
+@router.get(
+    "/{ticker}/report",
+    summary="Institutional analyst HTML report — all sections, deterministic (no credit)",
+    response_model=Envelope[dict],
+)
+def analyst_report(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Self-contained, PDF-ready HTML research report assembled server-side from
+    the deterministic engines (snapshot, exec summary, financials, DCF + scenario,
+    peers, earnings, risks, monitoring, provenance appendix, disclaimer). No
+    recomputation in the frontend, no LLM number. Fail-soft per section."""
+    started = time.perf_counter()
+    try:
+        out = rreport.build_analyst_report(ticker)
+    except Exception as exc:  # noqa: BLE001 - fail-soft backstop
+        _log.warning("research.report.failed ticker=%s err=%s", ticker, type(exc).__name__)
+        raise unprocessable(f"Could not build a report for {ticker!r}.") from exc
+    return ok({"report": out.model_dump()}, request=request, started_at=started)
+
+
+@router.post(
+    "/{ticker}/thesis",
+    summary="AI-grounded bull/bear/monitor thesis over deterministic evidence (credit-gated)",
+    response_model=Envelope[dict],
+)
+def research_thesis(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Bull/bear debate + what-to-monitor + management questions, written by the
+    LLM over the deterministic FactPack/DCF/earnings evidence ONLY (no invented
+    numbers — validated + flagged; no buy/sell/hold). No LLM key / failure →
+    deterministic fallback. Credit-gated; cache hit is free."""
+    started = time.perf_counter()
+    tk = ticker.strip().upper()
+
+    from ...services.ai_cache import verdict_cache
+    from ...services.ai_telemetry import input_hash
+
+    cache_key = input_hash(f"thesis:{tk}")
+    cached = verdict_cache.get(cache_key)
+    if cached is not None:
+        return ok({"thesis": cached}, request=request, started_at=started)
+
+    from ...services.llm_client import get_llm_callable
+
+    llm = get_llm_callable(with_tools=False)
+    if llm is not None:
+        from libs.billing.usage import ESTIMATED_COST_USD, QuotaExceeded, check_credits
+
+        try:
+            check_credits(
+                user.id, email=user.email, estimated_cost_usd=ESTIMATED_COST_USD["analysis"]
+            )
+        except QuotaExceeded as exc:
+            raise too_many_requests(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - fail-open on a metering blip
+            _log.warning("research.thesis.credit_check_failed reason=%s", type(exc).__name__)
+
+    try:
+        out = rthesis.build_thesis(tk, llm_callable=llm)
+    except Exception as exc:  # noqa: BLE001 - builder is fail-soft; backstop
+        _log.warning("research.thesis.failed ticker=%s err=%s", tk, type(exc).__name__)
+        raise unprocessable(f"Could not build a thesis for {tk!r}.") from exc
+
+    if llm is not None and out.ai_generated:
+        _record_thesis_cost(user.id, out, started, input_hash_value=cache_key)
+        verdict_cache.put(cache_key, out.model_dump())
+    return ok({"thesis": out.model_dump()}, request=request, started_at=started)
+
+
+def _record_thesis_cost(user_id: str, thesis, started: float, *, input_hash_value: str) -> None:
+    from libs.billing.costs import estimate_tokens
+
+    from ...services.ai_telemetry import record_ai_call
+
+    body = json.dumps(thesis.model_dump(), default=str)
+    record_ai_call(
+        user_id,
+        "analysis",
+        model=_VERDICT_MODEL,
+        tokens_in=1500,  # evidence + system prompt (rough)
+        tokens_out=estimate_tokens(body),
+        latency_ms=(time.perf_counter() - started) * 1000,
+        input_hash=input_hash_value,
+    )
+
+
+@router.get(
+    "/news/{ticker}",
+    summary="Unified, source-labeled news for a ticker (FMP news + press releases + SEC), no credit",
+    response_model=Envelope[TickerNewsResponse],
+)
+def ticker_news(
+    request: Request,
+    ticker: str = Path(min_length=1, max_length=20),
+    user: AuthedUser = Depends(require_user),
+):
+    """Combine FMP stock news + press releases (primary) with a SEC filings link,
+    deduped + classified + source-labeled. Fail-soft — never 500s, always returns
+    at least the SEC entry."""
+    started = time.perf_counter()
+    data = news_svc.get_ticker_news(ticker)
+    payload = TickerNewsResponse.model_validate(data).model_dump()
+    return ok(payload, request=request, started_at=started)
+
+
+@router.post(
+    "/verdict",
+    summary="LLM verdict over a FactPack (credit-gated)",
+    response_model=Envelope[dict],
+)
+def verdict(
+    body: VerdictRequest,
+    request: Request,
+    user: AuthedUser = Depends(require_user),
+):
+    started = time.perf_counter()
+
+    if not body.ticker and not body.fact_pack:
+        raise unprocessable("Provide either `ticker` or a `fact_pack`.")
+
+    # Prefer the FactPack the client already fetched (no second network hit).
+    if body.fact_pack is not None:
+        fp: FactPack = body.fact_pack
+    else:
+        try:
+            fp = rf.build_fact_pack(str(body.ticker))
+        except ValueError as exc:
+            raise unprocessable(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("research.verdict.factpack_failed err=%s", type(exc).__name__)
+            raise unprocessable(f"Could not build a FactPack for {body.ticker!r}.") from exc
+
+    # ── Response cache (input-hash, 45 min). A repeat verdict over the same
+    # FactPack costs nothing — return it before the credit gate so a cache
+    # hit never burns credits. The FactPack carries no user data, so the
+    # cache is safely shared across users researching the same ticker.
+    from ...services.ai_cache import verdict_cache
+    from ...services.ai_telemetry import input_hash
+
+    fp_json = json.dumps(fp.model_dump(), default=str, sort_keys=True)
+    cache_key = input_hash(fp_json)
+    cached = verdict_cache.get(cache_key)
+    if cached is not None:
+        return ok(
+            {"verdict": cached, "fact_pack": fp.model_dump()},
+            request=request,
+            started_at=started,
+        )
+
+    # ── Credit gate (LLM). Out of credits → 429; metering blip → fail-open. ──
+    from libs.billing.usage import ESTIMATED_COST_USD, QuotaExceeded, check_credits
+
+    try:
+        check_credits(user.id, email=user.email, estimated_cost_usd=ESTIMATED_COST_USD["analysis"])
+    except QuotaExceeded as exc:
+        raise too_many_requests(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("research.verdict.credit_check_failed reason=%s", type(exc).__name__)
+
+    from ...services.llm_client import get_llm_callable
+
+    llm = get_llm_callable(with_tools=False)
+    result = rf.build_verdict(fp, llm_callable=llm)
+
+    # Record ACTUAL cost + full telemetry — only when a real model ran.
+    if llm is not None and not result.data_only:
+        _record_verdict_cost(user.id, fp, result, started)
+        verdict_cache.put(cache_key, result.model_dump())
+
+    return ok(
+        {"verdict": result.model_dump(), "fact_pack": fp.model_dump()},
+        request=request,
+        started_at=started,
+    )
+
+
+def _record_verdict_cost(user_id: str, fp: FactPack, verdict, started: float) -> None:
+    from libs.billing.costs import estimate_tokens
+
+    from ...services.ai_telemetry import input_hash, record_ai_call
+
+    fp_json = json.dumps(fp.model_dump(), default=str, sort_keys=True)
+    tokens_in = estimate_tokens(fp_json) + 700  # + system prompt
+    tokens_out = estimate_tokens(json.dumps(verdict.model_dump(), default=str))
+    record_ai_call(
+        user_id,
+        "analysis",
+        model=_VERDICT_MODEL,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        latency_ms=(time.perf_counter() - started) * 1000,
+        input_hash=input_hash(fp_json),
+    )

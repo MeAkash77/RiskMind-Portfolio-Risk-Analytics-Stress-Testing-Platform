@@ -1,0 +1,37 @@
+# Runtime deps shared by the FastAPI backend + the legacy libs/ it imports.
+# The split-stack backend installs THIS file (backend/Dockerfile), so it must
+# stay free of Streamlit-only packages. The retired Streamlit app's deps
+# (streamlit, extra-streamlit-components, fpdf2) now live in requirements-dev.txt
+# — the legacy tests/ still exercise those libs/ modules, but the backend image
+# no longer ships them. plotly/kaleido/apify-client/tradingview-ta were dropped
+# outright (zero importers after the Streamlit app removal).
+# Upper bounds: prod builds resolve fresh at every image build, and unbounded
+# pins have ALREADY shipped silent major jumps (yfinance 0.2→1.4 blanked
+# earnings until lxml landed; pandas 3.x / numpy 2.5 / openai 2.x / stripe 15.x
+# all arrived unannounced — verified in the 2026-06-25 GHCR build log). Each
+# ceiling sits ABOVE what production currently runs, so nothing downgrades;
+# bump ceilings deliberately, with CI green, not by surprise.
+yfinance>=0.2.30,<2
+pandas>=2.0,<4
+numpy>=1.24,<3
+scipy>=1.11,<2
+anthropic>=0.40,<1
+openai>=1.0,<3
+requests>=2.31,<3
+structlog>=24.1.0,<27
+python-json-logger>=2.0.7,<5
+
+# Input validation at the Portfolio Copilot domain boundary. Already a
+# transitive dependency of supabase/anthropic, but pin explicitly so a
+# major release upstream can't drop it from the resolve.
+# PINNED EXACT so pydantic's OpenAPI schema output is identical across local /
+# prod / CI / OpenAPI-codegen (the contract-drift gate depends on it). This also
+# locks pydantic-core==2.41.5 (pydantic 2.12.5 pins it exactly). Bump alongside
+# the fastapi/starlette pins + contract.yml, re-verifying the contract.
+pydantic==2.12.5
+
+# Auth + per-user portfolios (Supabase Postgres + Auth + RLS)
+supabase>=2.9,<3
+
+# Billing (Stripe Checkout + subscription webhooks)
+stripe>=10.0,<16

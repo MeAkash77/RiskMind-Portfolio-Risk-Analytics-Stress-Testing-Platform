@@ -1,0 +1,207 @@
+/**
+ * PortfolioForm implied-P&L hint: shows market value + unrealized P&L per row
+ * from the live price, so a wrong avg cost is visible at entry (the SGOV case),
+ * with an amber nudge on a large deviation.
+ */
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { screen } from "@testing-library/react";
+import { renderWithQuery } from "@/test-utils";
+import { PortfolioForm, type PortfolioFormValues } from "./portfolio-form";
+
+function priceJson(prices: { ticker: string; price: number }[]) {
+  return new Response(
+    JSON.stringify({
+      data: { prices: prices.map((p) => ({ ...p, as_of: "2026-06-03" })), requested: prices.map((p) => p.ticker) },
+      error: null,
+      meta: { request_id: "p" },
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+function values(row: { ticker: string; shares: string; avg_cost: string }): PortfolioFormValues {
+  return {
+    name: "Test",
+    rows: [row],
+    margin_loan: "0",
+    contributed_capital: "0",
+    cash_balance: "0",
+    is_default: false,
+  };
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+describe("PortfolioForm implied P&L", () => {
+  it("surfaces the implied loss for a wrong cost basis (SGOV)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(priceJson([{ ticker: "SGOV", price: 100.41 }]));
+    renderWithQuery(
+      <PortfolioForm
+        initial={values({ ticker: "SGOV", shares: "110", avg_cost: "110.40" })}
+        submitLabel="Save"
+        busy={false}
+        onSubmit={vi.fn()}
+      />,
+    );
+    // 110 × (100.41 − 110.40) = −$1,099 → shown so the user catches the bad cost.
+    expect(await screen.findByText(/P&L −\$1,099/)).toBeInTheDocument();
+  });
+
+  it("nudges 'double-check the avg cost' on a large deviation", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(priceJson([{ ticker: "AAPL", price: 100 }]));
+    renderWithQuery(
+      <PortfolioForm
+        initial={values({ ticker: "AAPL", shares: "10", avg_cost: "300" })} // −67%
+        submitLabel="Save"
+        busy={false}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(await screen.findByText(/double-check the avg cost/i)).toBeInTheDocument();
+  });
+});
+
+import { occSymbol, rowsFromHoldings, valuesToCreateInput } from "./portfolio-form";
+import { optionContractsFromHoldings } from "@/lib/queries";
+
+describe("PortfolioForm option entry", () => {
+  it("builds an OCC contract symbol", () => {
+    expect(occSymbol("aapl", "2026-01-16", "call", 150)).toBe("AAPL260116C00150000");
+    expect(occSymbol("SPY", "2026-03-20", "put", 400.5)).toBe("SPY260320P00400500");
+  });
+
+  it("valuesToCreateInput keys an option by its OCC symbol with contract fields", () => {
+    const input = valuesToCreateInput({
+      name: "Opt book",
+      rows: [
+        { ticker: "AAPL", shares: "10", avg_cost: "180", kind: "equity" },
+        { ticker: "AAPL", shares: "2", avg_cost: "5.20", kind: "option", option_type: "call", strike: "150", expiry: "2026-01-16" },
+      ],
+      margin_loan: "0",
+      contributed_capital: "0",
+      cash_balance: "0",
+      is_default: false,
+    });
+    expect(input.holdings.AAPL.shares).toBe(10);
+    const opt = input.holdings.AAPL260116C00150000;
+    expect(opt.asset_type).toBe("option");
+    expect(opt.option_type).toBe("call");
+    expect(opt.underlying).toBe("AAPL");
+    expect(opt.strike).toBe(150);
+    expect(opt.expiry).toBe("2026-01-16");
+    expect(opt.contract_multiplier).toBe(100);
+    expect(opt.avg_cost).toBe(5.2);
+  });
+
+  it("drops a half-specified option (missing expiry)", () => {
+    const input = valuesToCreateInput({
+      name: "x",
+      rows: [{ ticker: "AAPL", shares: "1", avg_cost: "", kind: "option", option_type: "put", strike: "150", expiry: "" }],
+      margin_loan: "0",
+      contributed_capital: "0",
+      cash_balance: "0",
+      is_default: false,
+    });
+    expect(Object.keys(input.holdings)).toHaveLength(0);
+  });
+
+  it("round-trips a stored option holding back into an option row", () => {
+    const rows = rowsFromHoldings({
+      AAPL260116C00150000: {
+        shares: 2,
+        avg_cost: 5.2,
+        asset_type: "option",
+        option_type: "call",
+        underlying: "AAPL",
+        strike: 150,
+        expiry: "2026-01-16",
+      },
+    });
+    expect(rows[0].kind).toBe("option");
+    expect(rows[0].ticker).toBe("AAPL"); // underlying shown in the ticker field
+    expect(rows[0].option_type).toBe("call");
+    expect(rows[0].strike).toBe("150");
+    expect(rows[0].expiry).toBe("2026-01-16");
+  });
+});
+
+describe("PortfolioForm financing role", () => {
+  it("persists an explicit cash-equivalent override", () => {
+    const input = valuesToCreateInput({
+      name: "Treasury sleeve",
+      rows: [
+        {
+          ticker: "SGOV",
+          shares: "100",
+          avg_cost: "100",
+          kind: "equity",
+          liquidity_class: "cash_equivalent",
+        },
+      ],
+      margin_loan: "10000",
+      contributed_capital: "0",
+      cash_balance: "0",
+      is_default: false,
+    });
+    expect(input.holdings.SGOV.liquidity_class).toBe("cash_equivalent");
+  });
+
+  it("round-trips explicit risk-asset classification", () => {
+    const rows = rowsFromHoldings({
+      SGOV: { shares: 100, liquidity_class: "risk_asset" },
+    });
+    expect(rows[0].liquidity_class).toBe("risk_asset");
+  });
+});
+
+describe("PortfolioForm short option legs (PR4)", () => {
+  it("stores a sold leg as option_side short", () => {
+    const input = valuesToCreateInput({
+      name: "spread",
+      rows: [
+        { ticker: "AAPL", shares: "1", avg_cost: "8", kind: "option", option_type: "call", option_side: "long", strike: "150", expiry: "2027-01-15" },
+        { ticker: "AAPL", shares: "1", avg_cost: "3", kind: "option", option_type: "call", option_side: "short", strike: "170", expiry: "2027-01-15" },
+      ],
+      margin_loan: "0",
+      contributed_capital: "0",
+      cash_balance: "0",
+      is_default: false,
+    });
+    const long = input.holdings.AAPL270115C00150000;
+    const short = input.holdings.AAPL270115C00170000;
+    expect(long.option_side).toBe("long");
+    expect(short.option_side).toBe("short");
+    expect(short.shares).toBe(1); // stored as positive magnitude
+  });
+
+  it("optionContractsFromHoldings negates a short leg's quantity", () => {
+    const contracts = optionContractsFromHoldings({
+      AAPL270115C00170000: {
+        shares: 2,
+        asset_type: "option",
+        option_type: "call",
+        option_side: "short",
+        underlying: "AAPL",
+        strike: 170,
+        expiry: "2027-01-15",
+      },
+    });
+    expect(contracts[0].quantity).toBe(-2); // short → negative
+  });
+
+  it("round-trips a short leg back into the form", () => {
+    const rows = rowsFromHoldings({
+      AAPL270115C00170000: {
+        shares: 1,
+        asset_type: "option",
+        option_type: "call",
+        option_side: "short",
+        underlying: "AAPL",
+        strike: 170,
+        expiry: "2027-01-15",
+      },
+    });
+    expect(rows[0].option_side).toBe("short");
+  });
+});

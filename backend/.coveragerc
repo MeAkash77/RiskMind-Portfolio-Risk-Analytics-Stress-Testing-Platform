@@ -1,0 +1,23 @@
+# Backend-only coverage config. The root pyproject `[tool.coverage.run]` omits
+# `backend/*` (the root Streamlit-era suite never exercises it), so the backend
+# gets its OWN measurement here, run from the backend-tests CI job:
+#
+#   pytest backend/tests -o "addopts=" \
+#     --cov=backend.app --cov-config=backend/.coveragerc \
+#     --cov-report=term-missing --cov-fail-under=<baseline>
+[run]
+source = backend/app
+omit =
+    # The MCP server lives at backend/mcp_server/ (NOT backend/app/mcp_server/,
+    # which this line used to name and which has never existed). It already sits
+    # outside `source` above, so this entry is belt-and-braces intent, not a
+    # behaviour change — but a wrong path is a trap if `source` ever widens.
+    backend/mcp_server/*
+    */__init__.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.
+    raise NotImplementedError
+    if TYPE_CHECKING:

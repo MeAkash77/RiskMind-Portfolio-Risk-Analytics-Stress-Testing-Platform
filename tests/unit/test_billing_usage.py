@@ -1,0 +1,410 @@
+"""Tests for libs.billing.usage — all mocked, no real Supabase."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture
+def fake_streamlit(monkeypatch):
+    fake = MagicMock()
+    fake.session_state = {
+        "_auth_user": {"id": "user-1", "email": "x@y.com"},
+        "_auth_access_token": "JWT",
+    }
+    fake.secrets.get.return_value = ""
+    monkeypatch.setitem(sys.modules, "streamlit", fake)
+    return fake
+
+
+@pytest.fixture
+def supabase_env(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://test.supabase.co")
+    monkeypatch.setenv("SUPABASE_ANON_KEY", "anon")
+
+
+@pytest.fixture
+def mock_supabase(fake_streamlit, supabase_env):
+    """Mock Supabase client with chainable query builder."""
+    from libs.auth import client as auth_client
+
+    auth_client.reset_client_cache()
+
+    sb = MagicMock()
+    sb.postgrest.auth = MagicMock()
+    sb.table.return_value = sb
+    sb.select.return_value = sb
+    sb.insert.return_value = sb
+    sb.eq.return_value = sb
+    sb.gte.return_value = sb
+    sb.limit.return_value = sb
+
+    with patch("supabase.create_client", return_value=sb):
+        yield sb
+    auth_client.reset_client_cache()
+
+
+# ── Plan constants ──────────────────────────────────────────
+
+
+def test_plan_limits_match_schema_constraints():
+    from libs.billing.usage import PLAN_LIMITS
+
+    assert {"free", "basic", "pro"}.issubset(PLAN_LIMITS)
+    assert PLAN_LIMITS["owner"]["analysis"] is None
+    assert PLAN_LIMITS["owner"]["chat"] is None
+    for plan in PLAN_LIMITS.values():
+        assert "analysis" in plan
+        assert "chat" in plan
+
+
+def test_pricing_matches_plan_keys():
+    from libs.billing.usage import PLAN_LIMITS, PLAN_PRICING
+
+    assert set(PLAN_PRICING.keys()) == set(PLAN_LIMITS.keys())
+    assert PLAN_PRICING["free"]["price_usd_per_month"] == 0
+    assert PLAN_PRICING["basic"]["price_usd_per_month"] == 10
+    assert PLAN_PRICING["pro"]["price_usd_per_month"] == 25
+
+
+def test_billing_migration_does_not_allow_client_plan_updates():
+    """profiles.plan drives quota; clients must not be able to self-upgrade."""
+    migration = (
+        Path(__file__).resolve().parents[2] / "supabase" / "migrations" / "0002_billing.sql"
+    ).read_text(encoding="utf-8")
+    assert "drop policy if exists profiles_update_own" in migration
+    assert "create policy profiles_update_own" not in migration
+
+
+# ── get_user_plan ────────────────────────────────────────────
+
+
+def test_get_user_plan_returns_db_plan(mock_supabase):
+    mock_supabase.execute.return_value = MagicMock(data=[{"plan": "basic"}])
+    from libs.billing.usage import get_user_plan
+
+    assert get_user_plan("user-1") == "basic"
+
+
+def test_get_user_plan_defaults_free_on_missing_row(mock_supabase):
+    mock_supabase.execute.return_value = MagicMock(data=[])
+    from libs.billing.usage import get_user_plan
+
+    assert get_user_plan("user-1") == "free"
+
+
+def test_get_user_plan_defaults_free_on_db_exception(mock_supabase):
+    mock_supabase.execute.side_effect = Exception("db down")
+    from libs.billing.usage import get_user_plan
+
+    assert get_user_plan("user-1") == "free"
+
+
+def test_get_user_plan_rejects_unknown_plan(mock_supabase):
+    """Schema CHECK should prevent this, but defense in depth."""
+    mock_supabase.execute.return_value = MagicMock(data=[{"plan": "enterprise"}])
+    from libs.billing.usage import get_user_plan
+
+    assert get_user_plan("user-1") == "free"
+
+
+def test_get_user_plan_owner_bypasses_db(mock_supabase, monkeypatch):
+    monkeypatch.setenv("MINDMARKET_OWNER_EMAILS", "x@y.com")
+
+    from libs.billing.usage import get_user_plan
+
+    assert get_user_plan("user-1") == "owner"
+    mock_supabase.table.assert_not_called()
+
+
+# ── get_used_this_month ──────────────────────────────────────
+
+
+def test_get_used_returns_count(mock_supabase):
+    mock_supabase.execute.return_value = MagicMock(data=[], count=5)
+    from libs.billing.usage import get_used_this_month
+
+    assert get_used_this_month("user-1", "analysis") == 5
+
+
+def test_get_used_returns_huge_on_failure(mock_supabase):
+    """Fail-closed: if we can't count, assume over quota so we
+    don't silently let a user blow past their limit."""
+    mock_supabase.execute.side_effect = Exception("query failed")
+    from libs.billing.usage import get_used_this_month
+
+    assert get_used_this_month("user-1", "analysis") >= 999_999
+
+
+# ── check_quota ──────────────────────────────────────────────
+
+
+def test_check_quota_under_limit_does_not_record(mock_supabase):
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    count_resp = MagicMock(data=[], count=1)
+    daily_cost_resp = MagicMock(data=[{"cost_usd": 0.01}])
+    month_cost_resp = MagicMock(data=[{"cost_usd": 0.20}])
+    mock_supabase.execute.side_effect = [plan_resp, count_resp, daily_cost_resp, month_cost_resp]
+
+    from libs.billing.usage import check_quota
+
+    status = check_quota("user-1", "chat")
+    assert status["remaining"] == 1
+    mock_supabase.insert.assert_not_called()
+
+
+def test_check_quota_raises_when_daily_cost_limit_hit(mock_supabase, monkeypatch):
+    monkeypatch.setenv("MINDMARKET_DAILY_COST_LIMIT_USD", "0.05")
+    monkeypatch.setenv("MINDMARKET_MONTHLY_COST_LIMIT_USD", "50")
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    count_resp = MagicMock(data=[], count=0)
+    daily_cost_resp = MagicMock(data=[{"cost_usd": 0.04}])
+    month_cost_resp = MagicMock(data=[{"cost_usd": 1.00}])
+    mock_supabase.execute.side_effect = [plan_resp, count_resp, daily_cost_resp, month_cost_resp]
+
+    from libs.billing.usage import CostLimitExceeded, check_quota
+
+    with pytest.raises(CostLimitExceeded) as exc_info:
+        check_quota("user-1", "chat", estimated_cost_usd=0.02)
+    assert exc_info.value.scope == "daily"
+
+
+def test_check_and_consume_checks_cost_before_insert(mock_supabase, monkeypatch):
+    monkeypatch.setenv("MINDMARKET_DAILY_COST_LIMIT_USD", "2")
+    monkeypatch.setenv("MINDMARKET_MONTHLY_COST_LIMIT_USD", "1")
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    count_resp = MagicMock(data=[], count=0)
+    daily_cost_resp = MagicMock(data=[{"cost_usd": 0.10}])
+    month_cost_resp = MagicMock(data=[{"cost_usd": 0.99}])
+    mock_supabase.execute.side_effect = [plan_resp, count_resp, daily_cost_resp, month_cost_resp]
+
+    from libs.billing.usage import CostLimitExceeded, check_and_consume
+
+    with pytest.raises(CostLimitExceeded) as exc_info:
+        check_and_consume("user-1", "chat", cost_usd=0.02)
+    assert exc_info.value.scope == "monthly"
+    mock_supabase.insert.assert_not_called()
+
+
+# ── check_and_consume ────────────────────────────────────────
+
+
+def test_consume_under_limit_records_event(mock_supabase):
+    """Plan free: 2 analysis/mo. Used 0 → consume succeeds, records event."""
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    count_resp = MagicMock(data=[], count=0)
+    insert_resp = MagicMock(data=[{"id": "evt-1"}])
+
+    # First execute: get_user_plan; second: get_used; third: insert event;
+    # fourth+: get_quota_status calls
+    mock_supabase.execute.side_effect = [
+        plan_resp,
+        count_resp,
+        insert_resp,
+        plan_resp,
+        count_resp,
+        count_resp,
+    ]
+
+    from libs.billing.usage import check_and_consume
+
+    status = check_and_consume("user-1", "analysis")
+    assert status["plan"] == "free"
+
+
+def test_consume_at_limit_raises(mock_supabase):
+    """Free plan, already used 2 analyses this month → next call raises."""
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    count_resp = MagicMock(data=[], count=2)
+
+    mock_supabase.execute.side_effect = [plan_resp, count_resp]
+
+    from libs.billing.usage import QuotaExceeded, check_and_consume
+
+    with pytest.raises(QuotaExceeded) as exc_info:
+        check_and_consume("user-1", "analysis")
+    assert exc_info.value.used == 2
+    assert exc_info.value.limit == 2
+    assert exc_info.value.kind == "analysis"
+
+
+def test_consume_with_unlimited_kind_records_without_check(mock_supabase):
+    """tool_call has limit=None → record but never raise."""
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    insert_resp = MagicMock(data=[{"id": "evt-1"}])
+    count_resp = MagicMock(data=[], count=999)
+
+    mock_supabase.execute.side_effect = [
+        plan_resp,
+        count_resp,
+        insert_resp,
+        plan_resp,
+        count_resp,
+        count_resp,
+    ]
+
+    from libs.billing.usage import check_and_consume
+
+    status = check_and_consume("user-1", "tool_call")
+    assert status is not None  # didn't raise
+
+
+def test_owner_consume_is_unlimited_but_records(mock_supabase, monkeypatch):
+    monkeypatch.setenv("MINDMARKET_OWNER_EMAILS", "x@y.com")
+    insert_resp = MagicMock(data=[{"id": "evt-1"}])
+    used_analysis = MagicMock(data=[], count=99)
+    used_chat = MagicMock(data=[], count=88)
+
+    mock_supabase.execute.side_effect = [
+        used_chat,
+        insert_resp,
+        used_analysis,
+        used_chat,
+    ]
+
+    from libs.billing.usage import check_and_consume
+
+    status = check_and_consume("user-1", "chat")
+    assert status["plan"] == "owner"
+    assert status["kinds"]["chat"]["limit"] is None
+    assert status["kinds"]["chat"]["exhausted"] is False
+
+
+# ── get_quota_status ─────────────────────────────────────────
+
+
+def test_quota_status_shape(mock_supabase):
+    plan_resp = MagicMock(data=[{"plan": "basic"}])
+    used_analysis = MagicMock(data=[], count=10)
+    used_chat = MagicMock(data=[], count=50)
+
+    mock_supabase.execute.side_effect = [plan_resp, used_analysis, used_chat]
+
+    from libs.billing.usage import get_quota_status
+
+    s = get_quota_status("user-1")
+    assert s["plan"] == "basic"
+    assert s["label"] == "Basic"
+    assert "analysis" in s["kinds"]
+    assert "chat" in s["kinds"]
+    assert "tool_call" not in s["kinds"]  # excluded from UI surface
+    assert s["kinds"]["analysis"]["used"] == 10
+    assert s["kinds"]["analysis"]["limit"] == 30  # basic plan
+    assert s["kinds"]["analysis"]["remaining"] == 20
+    assert s["kinds"]["analysis"]["exhausted"] is False
+
+
+def test_quota_status_marks_exhausted(mock_supabase):
+    plan_resp = MagicMock(data=[{"plan": "free"}])
+    used_analysis = MagicMock(data=[], count=2)  # at the cap
+    used_chat = MagicMock(data=[], count=1)
+
+    mock_supabase.execute.side_effect = [plan_resp, used_analysis, used_chat]
+
+    from libs.billing.usage import get_quota_status
+
+    s = get_quota_status("user-1")
+    assert s["kinds"]["analysis"]["exhausted"] is True
+    assert s["kinds"]["analysis"]["remaining"] == 0
+    assert s["kinds"]["chat"]["exhausted"] is False
+
+
+# ── backend context: service-role client, session client unavailable ──
+#
+# In the streamlit-free FastAPI image, `_client()` raises (access_token()
+# needs the Streamlit session) — and even with streamlit installed a FastAPI
+# process has no session, so the anon insert dies on RLS. That kept EVERY
+# backend record_event silently dead from the 2026-05-29 cutover until the
+# _cost_client switch (fail-soft swallowed it; latest prod usage_events row
+# was 2026-05-29, verified empirically). These tests encode the contract:
+# billing reads/writes must work with the session client UNAVAILABLE.
+
+
+def _admin_fake():
+    sb = MagicMock()
+    sb.table.return_value = sb
+    sb.select.return_value = sb
+    sb.insert.return_value = sb
+    sb.eq.return_value = sb
+    sb.gte.return_value = sb
+    sb.limit.return_value = sb
+    return sb
+
+
+@pytest.fixture
+def backend_context(monkeypatch):
+    """Session client dead (like the backend image) + a working admin client."""
+    from libs.auth import admin_client as admin_mod
+    from libs.billing import usage as usage_mod
+
+    def no_session_client():
+        raise ModuleNotFoundError("No module named 'streamlit'")
+
+    monkeypatch.setattr(usage_mod, "_client", no_session_client)
+    sb = _admin_fake()
+    monkeypatch.setattr(admin_mod, "get_supabase_admin", lambda: sb)
+    return sb
+
+
+def test_record_event_writes_via_service_role_without_streamlit(backend_context):
+    from libs.billing.usage import record_event
+
+    backend_context.execute.return_value = MagicMock(data=[{"id": "x"}])
+    record_event(
+        "user-1",
+        "chat",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        tokens_in=100,
+        tokens_out=400,
+        cost_usd=0.0123,
+    )
+    backend_context.table.assert_called_with("usage_events")
+    inserted = backend_context.insert.call_args[0][0]
+    assert inserted["user_id"] == "user-1"
+    assert inserted["kind"] == "chat"
+    assert inserted["cost_usd"] == pytest.approx(0.0123)
+    backend_context.execute.assert_called_once()
+
+
+def test_get_user_plan_reads_via_service_role_without_streamlit(backend_context):
+    from libs.billing.usage import get_user_plan
+
+    backend_context.execute.return_value = MagicMock(data=[{"plan": "basic"}])
+    assert get_user_plan("user-1", email="someone@example.com") == "basic"
+
+
+def test_get_subscription_record_reads_via_service_role_without_streamlit(backend_context):
+    from libs.billing.usage import get_subscription_record
+
+    row = {"plan": "pro", "status": "active", "stripe_customer_id": "cus_1"}
+    backend_context.execute.return_value = MagicMock(data=[row])
+    assert get_subscription_record("user-1") == row
+
+
+def test_get_used_this_month_counts_via_service_role_without_streamlit(backend_context):
+    from libs.billing.usage import get_used_this_month
+
+    backend_context.execute.return_value = MagicMock(data=[], count=7)
+    assert get_used_this_month("user-1", "chat") == 7
+
+
+def test_record_event_still_fail_soft_when_no_client_at_all(monkeypatch):
+    """No admin key AND no session → the write is lost with a warning, never
+    an exception (the user-visible action must not break on telemetry)."""
+    from libs.auth import admin_client as admin_mod
+    from libs.billing import usage as usage_mod
+
+    def no_session_client():
+        raise ModuleNotFoundError("No module named 'streamlit'")
+
+    def no_admin():
+        raise RuntimeError("SUPABASE_SERVICE_KEY not configured")
+
+    monkeypatch.setattr(usage_mod, "_client", no_session_client)
+    monkeypatch.setattr(admin_mod, "get_supabase_admin", no_admin)
+    usage_mod.record_event("user-1", "chat")  # must not raise

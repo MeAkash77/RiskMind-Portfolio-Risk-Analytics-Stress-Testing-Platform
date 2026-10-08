@@ -1,0 +1,166 @@
+# compose.split.yml — CANONICAL production app services (backend + frontend).
+#
+# The live stack runs from TWO compose files sharing one project directory:
+#   * compose.split.yml (this file) — backend + frontend, GHCR pull-only images.
+#   * compose.aws.yml               — caddy (TLS terminator / reverse proxy).
+# The on-box systemd unit (`mindmarket.service`; reference copy in
+# deploy/mindmarket.service) brings both up with --no-build on boot.
+#
+# Deploys are PULL-ONLY on EC2 (t3.micro, ~916 MB RAM — an on-box build has
+# OOM'd the box twice; see docs/aws/ci-image-deploy.md, or just run
+# scripts/deploy-ec2.sh):
+#   MM_IMAGE_TAG=sha-<full-sha> docker compose -f compose.split.yml pull backend frontend
+#   MM_IMAGE_TAG=sha-<full-sha> docker compose -f compose.split.yml up -d --no-deps --no-build backend frontend
+# NEVER pass --remove-orphans — it would remove the caddy container, which is
+# owned by compose.aws.yml in the same project.
+#
+# History: the legacy `streamlit` service was removed 2026-06-23 (Streamlit
+# fully retired); the duplicate `caddy` service was removed 2026-07-01
+# (it shadowed compose.aws.yml's canonical caddy WITHOUT its awslogs logging —
+# a bare `up -d` here would have recreated prod caddy from the wrong
+# definition). The MCP server is stdio-only and deliberately not a service.
+
+# Cap container logs — Docker's default json-file driver has NO size limit,
+# and a retry-loop log storm on this disk-tight box (80%+ used) could fill
+# the disk and take all services down. Applied to both services below via
+# YAML anchor; takes effect on next container recreate. (caddy lives in
+# compose.aws.yml on the awslogs driver — not covered here by design.)
+x-logging: &log-cap
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  backend:
+    # Pull the CI-built image on EC2 (`docker compose pull`); `build:` stays
+    # for local dev. NEVER build this on the t3.micro — see the 2026-05-31
+    # OOM incident + .github/workflows/build-images.yml.
+    image: ghcr.io/zhengbrody/mindmarket-backend:${MM_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    expose:
+      - "8000"
+    environment:
+      # Public no-signup risk check — DEFAULT OFF (data-licensing decision
+      # pending; see backend/app/api/v1/public_risk.py). Flip via EC2 .env.
+      - PUBLIC_RISK_CHECK_ENABLED=${PUBLIC_RISK_CHECK_ENABLED:-false}
+      # Prod ingress is Cloudflare-only (SG locked to CF ranges), so the
+      # CF-Connecting-IP header is trustworthy HERE for rate-limit identity.
+      - TRUST_CF_CONNECTING_IP=${TRUST_CF_CONNECTING_IP:-true}
+      # Server-side secrets only. NEVER overlap with NEXT_PUBLIC_*.
+      # Modern Supabase projects verify JWTs through JWKS from
+      # SUPABASE_URL. SUPABASE_JWT_SECRET is only required for legacy
+      # HS256 projects; missing verification config fails closed.
+      - MINDMARKET_ENV=${MINDMARKET_ENV:-production}
+      - MINDMARKET_ALLOWED_ORIGINS=${MINDMARKET_ALLOWED_ORIGINS:-}
+      - MINDMARKET_OWNER_EMAIL=${MINDMARKET_OWNER_EMAIL:-}
+      - MINDMARKET_OWNER_EMAILS=${MINDMARKET_OWNER_EMAILS:-}
+      - MINDMARKET_APP_URL=${MINDMARKET_APP_URL:-}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET:-}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
+      # Independent HMAC key for coarse, expiring risk-card links (>=32 bytes).
+      # Blank fails closed: mint is unavailable and public resolution is 404.
+      - MINDMARKET_SHARE_SIGNING_SECRET=${MINDMARKET_SHARE_SIGNING_SECRET:-}
+      # Saved checks require migration 0014 plus a separate server-only HMAC key.
+      - MINDMARKET_COPILOT_RUNS_ENABLED=${MINDMARKET_COPILOT_RUNS_ENABLED:-false}
+      # Signed comparison receipts (replay) and explicitly confirmed saved
+      # drafts. Both default off and fail closed without the signing key below;
+      # save additionally requires migration 0015. These MUST be listed here —
+      # a value set only in the EC2 .env is not visible inside the container.
+      - MINDMARKET_COMPARISON_REPLAY_ENABLED=${MINDMARKET_COMPARISON_REPLAY_ENABLED:-false}
+      - MINDMARKET_COMPARISON_SAVE_ENABLED=${MINDMARKET_COMPARISON_SAVE_ENABLED:-false}
+      # Shared root HMAC key for run journals and comparison receipts (>=32 bytes).
+      - MINDMARKET_RISK_RUN_SIGNING_SECRET=${MINDMARKET_RISK_RUN_SIGNING_SECRET:-}
+      # SUPABASE_SERVICE_KEY is the service-role key: server-only, used by
+      # trusted owner/admin paths for platform-wide usage/cost visibility, and
+      # must never be rendered in the UI. (It used to live on the retired
+      # Streamlit `app`; the backend is its sole consumer now — guarded by
+      # tests/unit/test_deploy_config.py.)
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY:-}
+      - FMP_API_KEY=${FMP_API_KEY:-}
+      # Massive Stocks (Basic) — OPTIONAL fallback market price/history source.
+      # Blank → yfinance remains the source. Base URL / endpoint paths are
+      # overridable so the live Basic contract can be corrected without a rebuild.
+      - MASSIVE_API_KEY=${MASSIVE_API_KEY:-}
+      - MASSIVE_BASE_URL=${MASSIVE_BASE_URL:-}
+      - MASSIVE_EOD_PATH=${MASSIVE_EOD_PATH:-}
+      - MASSIVE_HISTORY_PATH=${MASSIVE_HISTORY_PATH:-}
+      - MASSIVE_REFERENCE_PATH=${MASSIVE_REFERENCE_PATH:-}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_BASIC_PRICE_ID=${STRIPE_BASIC_PRICE_ID:-}
+      - STRIPE_PRO_PRICE_ID=${STRIPE_PRO_PRICE_ID:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      # DeepSeek is the default AI provider while Anthropic quota is constrained.
+      - MINDMARKET_LLM_PROVIDER=${MINDMARKET_LLM_PROVIDER:-deepseek}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-}
+      # Turns v4 reasoning off (blank => send no parameter). Documented as
+      # tunable without a deploy, which is only true if it is forwarded.
+      - DEEPSEEK_REASONING_EFFORT=${DEEPSEEK_REASONING_EFFORT:-}
+      - DEEPSEEK_BALANCE_URL=${DEEPSEEK_BALANCE_URL:-}
+      # Owner API-balance card: the Claude top-up is entered in /admin, but
+      # the env path is documented as an alternative and must actually work.
+      - DEEPSEEK_LOW_BALANCE=${DEEPSEEK_LOW_BALANCE:-}
+      - ANTHROPIC_TOPUP_USD=${ANTHROPIC_TOPUP_USD:-}
+      - ANTHROPIC_TOPUP_SINCE=${ANTHROPIC_TOPUP_SINCE:-}
+      - ANTHROPIC_WARN_PCT=${ANTHROPIC_WARN_PCT:-}
+      - ANTHROPIC_CRITICAL_PCT=${ANTHROPIC_CRITICAL_PCT:-}
+      # Optional shared cache (services/cache.py). Blank => in-process store.
+      - REDIS_URL=${REDIS_URL:-}
+      # Anthropic is optional fallback/configurable provider; deterministic
+      # fallbacks keep the app usable when no LLM key is present.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Weekly risk digest email (all optional — blank disables sends).
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - DIGEST_CRON_TOKEN=${DIGEST_CRON_TOKEN:-}
+      - DIGEST_FROM=${DIGEST_FROM:-}
+      - DIGEST_SITE_URL=${DIGEST_SITE_URL:-}
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging: *log-cap
+
+  frontend:
+    # Pull the CI-built image on EC2 (`docker compose pull`); `build:` stays
+    # for local dev. NEVER build this on the t3.micro — the Next.js build
+    # OOM'd the box (2026-05-31). CI bakes the NEXT_PUBLIC_* args (below)
+    # from GitHub repo Variables; see .github/workflows/build-images.yml.
+    image: ghcr.io/zhengbrody/mindmarket-frontend:${MM_IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* values are baked into the JS bundle at build
+        # time — see frontend/Dockerfile. To rebuild for a new public
+        # API origin, change these and `docker compose build frontend`.
+        # In production we want the same-origin path so the browser
+        # talks to the backend through Caddy.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+        NEXT_PUBLIC_COPILOT_RUNS_ENABLED: ${NEXT_PUBLIC_COPILOT_RUNS_ENABLED:-false}
+    expose:
+      - "3000"
+    environment:
+      # Server Components resolve public signed share cards directly against
+      # FastAPI. This internal URL is not a secret and never enters the browser.
+      - MINDMARKET_INTERNAL_API_BASE_URL=${MINDMARKET_INTERNAL_API_BASE_URL:-http://backend:8000}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "--quiet", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *log-cap

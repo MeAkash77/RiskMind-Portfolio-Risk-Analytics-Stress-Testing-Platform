@@ -1,0 +1,69 @@
+# MindMarket backend (FastAPI) — Phase 1 dependencies.
+#
+# These are ADDITIONAL packages the backend needs on top of the
+# existing root-level ``requirements.txt`` (numpy, pandas, pydantic,
+# supabase, anthropic, etc.). Pip-install both in CI / Docker:
+#
+#     pip install -r requirements.txt
+#     pip install -r backend/requirements-backend.txt
+#
+# Kept deliberately small: every line is justified below.
+
+# FastAPI + Starlette, PINNED EXACT to keep local / prod / CI / OpenAPI-codegen
+# byte-identical (the contract-drift gate depends on it). starlette is pinned
+# explicitly (>=1.3.1) because fastapi 0.139 only requires `starlette>=0.46.0`
+# (no ceiling) — the exact pin clears all 7 starlette 0.48.0 CVEs
+# (PYSEC-2026-161/248/249/1942, CVE-2026-48817/48818; fixed in starlette 1.3.1)
+# and stops a fresh install resolving an older, vulnerable starlette. Bumping
+# these is deliberate: bump here + contract.yml pins together and re-verify the
+# openapi.json/api-types.ts are unchanged (or regenerate + explain the diff).
+fastapi==0.139.0
+starlette==1.3.1
+uvicorn[standard]>=0.30,<0.35
+
+# Supabase JWT verification. PyJWT handles JWT parsing / claims; the
+# cryptography backend is required for Supabase projects that sign
+# access tokens with asymmetric ES256 / RS256 keys exposed through
+# JWKS.
+PyJWT>=2.8,<3
+# Floor is a SECURITY floor, not a preference: 48.0.1 carries PYSEC-2026-3552
+# (fixed in 50.0.0) plus PYSEC-2026-3553/3554 (fixed in 49.0.0), and the old
+# `<49` ceiling was itself what pinned the vulnerable build. Ceiling kept so a
+# future major still can't land unreviewed — raise both together.
+cryptography>=50,<51
+
+# httpx is FastAPI's recommended async HTTP client AND drives the
+# TestClient used in backend/tests/. Already pulled in transitively by
+# fastapi[all], but we list it so the explicit ``pip install -r`` works
+# even if upstream extras change.
+httpx>=0.27,<1
+
+# MCP — Anthropic's Model Context Protocol SDK. Powers the standalone
+# tool server in backend/mcp_server/ that any Claude-compatible client
+# (Claude Desktop, Claude Code) can connect to via stdio. Optional at
+# runtime (only the ``python -m backend.mcp_server`` entry point
+# imports it), but pinned here so a fresh contributor install gets a
+# working MCP environment without an extra step.
+mcp>=1.0,<2
+
+# Sentry — error tracking. The FastAPI integration auto-captures unhandled
+# 500s (e.g. an uncaught ValidationError) with full context. Only initialised
+# in production (see app/main.py:_maybe_init_sentry); a no-op otherwise.
+sentry-sdk[fastapi]>=2.0,<3
+
+# lxml — required by yfinance 1.4.x's get_earnings_dates() (it parses the Yahoo
+# earnings calendar via pandas.read_html, which needs an HTML backend). Without
+# it that call raises ImportError and the free-yfinance EPS beat/miss fallback
+# in providers/fmp_provider._yf_earnings silently fail-softs to empty. The rest
+# of yfinance (price/.info JSON) does NOT need lxml — only the earnings scrape.
+lxml>=5,<7
+
+# ML regime classifier (backend/app/ml/). scikit-learn ONLY — NOT xgboost/
+# lightgbm (their ~90MB import would crowd the 916MB box; sklearn is ~25MB and
+# inference is sub-ms). Training is OFFLINE (CI / local), never in the request
+# path. The version is PINNED to the minor the model artifact is trained on: a
+# joblib/pickle sklearn model is not guaranteed to load across minor versions,
+# so the image MUST match the trainer (the artifact's regime_meta.json records
+# the exact sklearn_version, and the loader warns on mismatch).
+scikit-learn>=1.8,<1.9
+joblib>=1.4,<2

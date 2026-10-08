@@ -1,0 +1,61 @@
+"""
+libs.auth — Supabase Auth integration for the MindMarket Streamlit app.
+
+What lives here:
+  - client.py       : Supabase client singleton (lazy-init from env or st.secrets)
+  - session.py      : load/save/refresh JWT in st.session_state
+  - guards.py       : @require_auth decorator + redirect helpers
+  - portfolios.py   : per-user portfolio CRUD over the `portfolios` table
+
+Why a separate package: keeps auth concerns out of app.py / pages/, lets
+Phase 2 Lambdas optionally validate the same JWTs in a future iteration
+without dragging Streamlit into Lambda.
+
+Env vars read (or st.secrets fallback):
+    SUPABASE_URL              project URL, e.g. https://xxx.supabase.co
+    SUPABASE_ANON_KEY         anon public JWT (safe to ship to client)
+    SUPABASE_SERVICE_KEY      service-role JWT (DO NOT ship; server-side only,
+                                                used for admin tasks like
+                                                "list all users" or seeding)
+"""
+
+from .client import AuthError, get_supabase
+
+try:
+    # guards.py is Streamlit-only (the @require_auth_page page decorator). The
+    # Streamlit app was removed, so this package-level re-export now has no
+    # importers — but a legacy unit test still imports guards directly. Guard the
+    # re-export so `import libs.auth.<submodule>` (the backend's path into auth)
+    # no longer drags Streamlit into the backend/prod image, while a
+    # Streamlit-present env (dev/test extras) keeps the real symbol.
+    from .guards import require_auth_page
+except ModuleNotFoundError:  # streamlit not installed (backend/prod)
+    require_auth_page = None  # type: ignore[assignment]
+from .session import (
+    complete_oauth_with_code,
+    current_user,
+    hydrate_session_from_tokens,
+    is_authenticated,
+    persist_current_session_cookie,
+    resend_confirmation_email,
+    sign_in_with_oauth,
+    sign_in_with_password,
+    sign_out,
+    sign_up_with_password,
+)
+
+__all__ = [
+    "get_supabase",
+    "AuthError",
+    "require_auth_page",
+    "current_user",
+    "sign_in_with_password",
+    "sign_in_with_oauth",
+    "complete_oauth_with_code",
+    "hydrate_session_from_tokens",
+    "persist_current_session_cookie",
+    "sign_up_with_password",
+    "resend_confirmation_email",
+    "sign_out",
+    "is_authenticated",
+]

@@ -1,0 +1,376 @@
+"""
+libs/auth/session.py
+
+Per-Streamlit-session auth state. We keep the Supabase access token +
+refresh token in st.session_state so reruns don't kick the user out;
+on first import we attempt to restore from cookie if present.
+
+The flow:
+  1. User submits email + password via login form
+  2. sign_in_with_password() calls Supabase Auth, gets {access_token,
+     refresh_token, user}
+  3. We store all three in st.session_state under stable keys
+  4. Subsequent calls use current_user() to access the authenticated user
+
+Limitations of Streamlit auth:
+  - st.session_state is per-tab; closing the browser drops the session.
+    "Remember me" requires writing to a browser cookie, which Streamlit
+    doesn't natively support — Phase 3 may add streamlit-extras' cookie
+    helpers if there's demand.
+  - No CSRF protection out of the box. Streamlit's reactive model means
+    every interaction is a new HTTP request, so CSRF tokens would need
+    middleware. Acceptable risk: this is a personal-portfolio app, not
+    a banking site.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import time
+from typing import Optional
+
+from .client import AuthError, get_supabase
+
+_logger = logging.getLogger(__name__)
+
+# Refresh the access token once it's within this many seconds of expiring.
+# Supabase JWTs default to 3600s lifetime; 60s buffer leaves room for the
+# refresh round-trip while still letting most calls reuse the cached token.
+_REFRESH_BUFFER_SEC = 60
+
+# Stable keys in st.session_state. Prefix with `_auth_` so other code
+# can't accidentally collide.
+_KEY_USER = "_auth_user"
+_KEY_ACCESS = "_auth_access_token"
+_KEY_REFRESH = "_auth_refresh_token"
+
+
+def _ss():
+    """Lazy import streamlit so this module is importable from Lambda."""
+    import streamlit as st
+
+    return st.session_state
+
+
+def is_authenticated() -> bool:
+    """Cheap check — used to gate UI; doesn't validate the token's freshness."""
+    return _ss().get(_KEY_USER) is not None
+
+
+def current_user() -> Optional[dict]:
+    """Return the cached user dict, or None.
+
+    Shape (subset of Supabase's User):
+        {"id": "...", "email": "...", "user_metadata": {...}}
+    """
+    return _ss().get(_KEY_USER)
+
+
+def sign_up_with_password(email: str, password: str) -> dict:
+    """Register a new account.
+
+    Returns a dict with the user info AND a flag `email_confirmed` that
+    tells the caller whether Supabase auto-confirmed the email (project
+    setting: Auth → Providers → Email → "Confirm email" = OFF) or whether
+    the user must click a link in their inbox before signing in.
+
+    Why we expose this flag: the success message changes by project mode.
+    Telling a user "check your inbox" when confirmation is OFF causes
+    them to wait forever for an email that will never arrive.
+    """
+    sb = get_supabase()
+    try:
+        resp = sb.auth.sign_up({"email": email, "password": password})
+    except Exception as e:
+        # Supabase returns AuthApiError subclass with .message; surface it.
+        msg = getattr(e, "message", None) or str(e)
+        raise AuthError(msg)
+
+    if resp.user is None:
+        raise AuthError("Sign-up returned no user — check Supabase logs.")
+
+    user_dict = _user_to_dict(resp.user)
+    # If Supabase issued a session, email confirmation is disabled in the
+    # project and the user is already signed in.
+    user_dict["email_confirmed"] = resp.session is not None
+    if resp.session is not None:
+        state = _ss()
+        state[_KEY_USER] = user_dict
+        state[_KEY_ACCESS] = resp.session.access_token
+        state[_KEY_REFRESH] = resp.session.refresh_token
+        _persist_refresh_token(resp.session.refresh_token)
+    return user_dict
+
+
+def sign_in_with_oauth(provider: str, *, redirect_to: Optional[str] = None) -> str:
+    """Begin an OAuth flow with `provider` (e.g. 'google', 'github').
+
+    Returns the Supabase-generated authorization URL. The caller is
+    responsible for navigating the user's browser there. After successful
+    auth the user lands back at `redirect_to` with `access_token` +
+    `refresh_token` in the URL FRAGMENT (`#access_token=...`).
+
+    Streamlit can't read URL fragments directly, so the Login page injects
+    a tiny JS snippet that rewrites the fragment to query params, then
+    `hydrate_session_from_tokens()` finishes the round-trip.
+
+    Errors raise AuthError with the Supabase-provided message so the UI
+    can render it directly.
+    """
+    sb = get_supabase()
+    try:
+        params: dict = {"provider": provider}
+        if redirect_to:
+            params["options"] = {"redirect_to": redirect_to}
+        resp = sb.auth.sign_in_with_oauth(params)
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e)
+        raise AuthError(msg)
+    url = getattr(resp, "url", None)
+    if not url:
+        raise AuthError("OAuth provider did not return an authorization URL.")
+    return url
+
+
+def complete_oauth_with_code(code: str) -> dict:
+    """Finish the PKCE OAuth round-trip and write the session.
+
+    Supabase returns the user to our app with `?code=XXX`. supabase-py's
+    `exchange_code_for_session` pairs that with the PKCE code_verifier it
+    stashed at sign_in_with_oauth time (in the cached client's storage)
+    and returns the issued tokens. We mirror those into session_state so
+    every other lib in the app sees the user as signed in.
+
+    The cached client is what makes this work: `get_supabase()` returns
+    the SAME instance across Streamlit reruns, so the code_verifier
+    written before the redirect is still in `client.auth._storage` when
+    the user returns.
+    """
+    if not code:
+        raise AuthError("Missing OAuth code in callback.")
+    sb = get_supabase()
+    try:
+        resp = sb.auth.exchange_code_for_session({"auth_code": code})
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e)
+        raise AuthError(msg)
+
+    session = getattr(resp, "session", None)
+    user = getattr(resp, "user", None)
+    if session is None or user is None:
+        raise AuthError("OAuth exchange returned no session.")
+
+    user_dict = _user_to_dict(user)
+    state = _ss()
+    state[_KEY_USER] = user_dict
+    state[_KEY_ACCESS] = session.access_token
+    state[_KEY_REFRESH] = session.refresh_token
+    _persist_refresh_token(session.refresh_token)
+    return user_dict
+
+
+def hydrate_session_from_tokens(access_token: str, refresh_token: str) -> dict:
+    """Write OAuth-issued tokens into session_state.
+
+    Called when the OAuth callback page receives `?access_token=...&
+    refresh_token=...` (after the JS bridge converts URL fragment to
+    query params). Validates the tokens by asking Supabase for the
+    associated user; raises AuthError if invalid/expired.
+    """
+    if not access_token or not refresh_token:
+        raise AuthError("Missing access or refresh token on callback.")
+    sb = get_supabase()
+    try:
+        resp = sb.auth.set_session(access_token, refresh_token)
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e)
+        raise AuthError(msg)
+    user = getattr(resp, "user", None)
+    if user is None:
+        raise AuthError("OAuth callback returned no user.")
+    user_dict = _user_to_dict(user)
+    state = _ss()
+    state[_KEY_USER] = user_dict
+    state[_KEY_ACCESS] = access_token
+    state[_KEY_REFRESH] = refresh_token
+    _persist_refresh_token(refresh_token)
+    return user_dict
+
+
+def resend_confirmation_email(email: str) -> None:
+    """Re-send the signup confirmation email to a user who didn't get one.
+
+    Common reasons the original didn't arrive:
+      - Supabase free-tier SMTP rate limit (3 emails/hour)
+      - Email landed in spam (noreply@mail.app.supabase.io is heavily filtered)
+      - User typo'd their address
+
+    Errors raise AuthError with the Supabase-provided message so the UI
+    can render it directly. No-op on "already confirmed" — Supabase
+    returns 200 in that case.
+    """
+    sb = get_supabase()
+    try:
+        sb.auth.resend({"type": "signup", "email": email})
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e)
+        raise AuthError(msg)
+
+
+def sign_in_with_password(email: str, password: str) -> dict:
+    """Authenticate. Stores tokens + user in session state. Returns user dict."""
+    sb = get_supabase()
+    try:
+        resp = sb.auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as e:
+        msg = getattr(e, "message", None) or str(e)
+        raise AuthError(msg)
+
+    if resp.user is None or resp.session is None:
+        raise AuthError("Login failed — server returned no session.")
+
+    user_dict = _user_to_dict(resp.user)
+    state = _ss()
+    state[_KEY_USER] = user_dict
+    state[_KEY_ACCESS] = resp.session.access_token
+    state[_KEY_REFRESH] = resp.session.refresh_token
+    _persist_refresh_token(resp.session.refresh_token)
+    return user_dict
+
+
+def sign_out() -> None:
+    """Clear session and revoke the token server-side."""
+    state = _ss()
+    if state.get(_KEY_ACCESS):
+        try:
+            get_supabase().auth.sign_out()
+        except Exception:
+            pass  # best-effort; even if the network call fails, we still clear locally
+    for k in (_KEY_USER, _KEY_ACCESS, _KEY_REFRESH):
+        state.pop(k, None)
+    _clear_persisted_refresh_token()
+
+
+def _persist_refresh_token(refresh_token: str) -> None:
+    """Best-effort cookie write so the next page load can restore us.
+
+    Imported lazily because the cookie module pulls in
+    extra-streamlit-components, which is an optional dep — auth must
+    still work without it (e.g. CI containers, Lambda smoke tests).
+    """
+    try:
+        from .cookie_persist import save_refresh_token
+
+        save_refresh_token(refresh_token)
+    except Exception as e:
+        _logger.warning("auth.session.persist_failed: %s", e)
+
+
+def persist_current_session_cookie() -> bool:
+    """Rewrite the current refresh token to the browser cookie.
+
+    Use this immediately before handing a signed-in user to Stripe. It gives
+    the browser a fresh long-lived cookie even if the original login happened
+    in a short-lived Streamlit session.
+    """
+    refresh_token = _ss().get(_KEY_REFRESH)
+    if not refresh_token:
+        return False
+    _persist_refresh_token(refresh_token)
+    return True
+
+
+def _clear_persisted_refresh_token() -> None:
+    try:
+        from .cookie_persist import clear_refresh_token
+
+        clear_refresh_token()
+    except Exception as e:
+        _logger.warning("auth.session.clear_persisted_failed: %s", e)
+
+
+def restore_session_from_cookie() -> bool:
+    """Page-load hook: if the in-memory session is empty but the cookie
+    has a valid refresh_token, hydrate session_state. Returns True if
+    a session was restored.
+
+    Call this once at the top of pages (via the shared sidebar) BEFORE
+    reading current_user() / is_authenticated(). It's a no-op when the
+    user is already logged in via session_state.
+    """
+    try:
+        from .cookie_persist import try_restore_session
+
+        return try_restore_session()
+    except Exception as e:
+        _logger.info("auth.session.restore_failed: %s", e)
+        return False
+
+
+def access_token() -> Optional[str]:
+    """JWT for downstream API calls.
+
+    Auto-refreshes silently when the cached token is within
+    _REFRESH_BUFFER_SEC of expiry. Returns None if the user is signed out.
+    """
+    _maybe_refresh_token()
+    return _ss().get(_KEY_ACCESS)
+
+
+def _jwt_expiry(token: str) -> Optional[int]:
+    """Read the `exp` claim from a JWT without verifying its signature.
+
+    We don't need to verify here — the server will verify on every request.
+    We only want to know whether to proactively refresh.
+    """
+    try:
+        _, payload_b64, _ = token.split(".")
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        exp = payload.get("exp")
+        return int(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
+def _maybe_refresh_token() -> None:
+    """Refresh the access token via the refresh token when it's near expiry.
+
+    Without this, PostgREST starts returning 401 ~1 hour after login and
+    every Supabase call silently fails until the user re-signs-in.
+    """
+    state = _ss()
+    access = state.get(_KEY_ACCESS)
+    refresh = state.get(_KEY_REFRESH)
+    if not access or not refresh:
+        return
+    exp = _jwt_expiry(access)
+    if exp is None:
+        return
+    if exp - int(time.time()) > _REFRESH_BUFFER_SEC:
+        return
+    try:
+        resp = get_supabase().auth.refresh_session(refresh)
+        if resp and resp.session is not None:
+            state[_KEY_ACCESS] = resp.session.access_token
+            state[_KEY_REFRESH] = resp.session.refresh_token
+            # Rotate the cookie too — Supabase issues a new refresh token
+            # on each exchange; the old one is invalidated.
+            _persist_refresh_token(resp.session.refresh_token)
+            _logger.info("auth.session.refreshed")
+    except Exception as e:
+        # Leave stale token in place — the next downstream 401 will surface
+        # to the user, who can sign back in. Better than a silent crash.
+        _logger.warning("auth.session.refresh_failed: %s", e)
+
+
+def _user_to_dict(user) -> dict:
+    """Convert Supabase's User object to a JSON-friendly dict."""
+    return {
+        "id": user.id,
+        "email": user.email,
+        "user_metadata": getattr(user, "user_metadata", {}) or {},
+        "created_at": getattr(user, "created_at", None),
+    }

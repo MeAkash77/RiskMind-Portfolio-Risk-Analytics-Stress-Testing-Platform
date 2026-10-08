@@ -1,0 +1,258 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * MindMarket market-synced theme.
+ * `:root` = light palette (clean white/gray) shown during US market hours
+ * (09:30-16:00 ET, Mon-Fri). `.dark` = Bloomberg-ish near-black shown
+ * after-hours / overnight / weekends. The `.dark` class is toggled on
+ * <html> by the boot script + <MarketThemeSync> in layout.tsx based on the
+ * live ET session (see lib/market-hours.ts).
+ */
+@layer base {
+  :root {
+    --background: 220 14% 96%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --muted: 220 14% 92%;
+    --muted-foreground: 220 9% 46%;
+    --border: 220 13% 88%;
+    --input: 220 13% 88%;
+    --ring: 217 91% 60%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 100%;
+    --accent: 220 14% 92%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 142 71% 45%;
+    --warning: 38 92% 50%;
+    --radius: 0.5rem;
+  }
+  /*
+   * Marketing-surface palette — the premium "Citadel × Robinhood" look used by
+   * every pre-login page (landing / product / learn / demo / auth). MARKET-SYNCED:
+   * these flip with the same `.dark` the app uses (light during the trading day,
+   * dark overnight). Dark = the canonical brand-mark palette; light = a clean
+   * paper variant. Kept as `--mm-*` (distinct from the app's shadcn tokens) so the
+   * marketing aesthetic stays its own thing. Consumed via the `C` object in
+   * components/marketing/theme.ts.
+   */
+  :root {
+    --mm-bg: #f5f7fa;
+    --mm-panel: #ffffff;
+    --mm-text: #0b0e11;
+    --mm-text-dim: #4d5763;
+    --mm-text-faint: rgba(77, 87, 99, 0.7);
+    --mm-teal: #0b7285;
+    --mm-teal-deep: #0b5563;
+    --mm-gold: #a8780c;
+    --mm-up: #15803d;
+    --mm-down: #dc2626;
+    --mm-hairline: rgba(11, 14, 17, 0.1);
+    --mm-hairline-strong: rgba(11, 14, 17, 0.18);
+    --mm-card-grad: linear-gradient(180deg, rgba(11, 14, 17, 0.025), rgba(11, 14, 17, 0.006));
+    --mm-nav-bg: rgba(245, 247, 250, 0.8);
+    --mm-glow-teal: rgba(11, 114, 133, 0.1);
+    --mm-glow-gold: rgba(168, 120, 12, 0.08);
+    --mm-stat-grad: linear-gradient(180deg, #0b0e11, #3a4654);
+    --mm-cta-bg: #0b0e11;
+    --mm-cta-fg: #f8fafc;
+    --mm-track: rgba(11, 14, 17, 0.07);
+    --mm-surface-faint: rgba(11, 14, 17, 0.03);
+  }
+  .dark {
+    --mm-bg: #0b0e11;
+    --mm-panel: #10171d;
+    --mm-text: #f8fafc;
+    --mm-text-dim: #aab4c2;
+    --mm-text-faint: rgba(170, 180, 194, 0.72);
+    --mm-teal: #39a3b5;
+    --mm-teal-deep: #0b7285;
+    --mm-gold: #d4a017;
+    --mm-up: #38d39f;
+    --mm-down: #ff6b6b;
+    --mm-hairline: rgba(255, 255, 255, 0.09);
+    --mm-hairline-strong: rgba(255, 255, 255, 0.16);
+    --mm-card-grad: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012));
+    --mm-nav-bg: rgba(7, 9, 12, 0.72);
+    --mm-glow-teal: rgba(47, 167, 188, 0.2);
+    --mm-glow-gold: rgba(224, 174, 42, 0.12);
+    --mm-stat-grad: linear-gradient(180deg, #fff, #9fb0c0);
+    --mm-cta-bg: #f8fafc;
+    --mm-cta-fg: #0a0d11;
+    --mm-track: rgba(255, 255, 255, 0.07);
+    --mm-surface-faint: rgba(255, 255, 255, 0.03);
+  }
+  .dark {
+    /* Bloomberg-ish near-black background; slate cards; sky-blue primary. */
+    --background: 222 47% 5%;
+    --foreground: 210 40% 96%;
+    --card: 222 33% 9%;
+    --card-foreground: 210 40% 96%;
+    --muted: 217 33% 14%;
+    --muted-foreground: 215 20% 65%;
+    --border: 217 33% 18%;
+    --input: 217 33% 14%;
+    --ring: 199 89% 48%;
+    --primary: 199 89% 48%;
+    --primary-foreground: 222 47% 5%;
+    --accent: 217 33% 14%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 142 71% 45%;
+    --warning: 38 92% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background font-sans text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    /* Institutional numeric discipline: fixed-width (tabular) numerals so
+       figures align in columns everywhere — KPI tiles, tables, deltas —
+       the way a trading terminal renders numbers. Prose is unaffected
+       (only digit glyph widths change). */
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* App-only treatment: marketing keeps its own palette and art direction. */
+@layer components {
+  .workspace-shell {
+    --background: 160 12% 97%;
+    --foreground: 160 15% 10%;
+    --card: 0 0% 100%;
+    --card-foreground: 160 15% 10%;
+    --muted: 160 10% 93%;
+    --muted-foreground: 160 5% 40%;
+    --border: 160 10% 87%;
+    --input: 160 10% 87%;
+    --primary: 158 78% 25%;
+    --primary-foreground: 0 0% 100%;
+    --ring: 158 78% 25%;
+    --accent: 160 15% 93%;
+    --accent-foreground: 160 15% 10%;
+  }
+  .dark .workspace-shell {
+    --background: 160 9% 6%;
+    --foreground: 150 10% 96%;
+    --card: 160 8% 9%;
+    --card-foreground: 150 10% 96%;
+    --muted: 160 7% 14%;
+    --muted-foreground: 160 5% 66%;
+    --border: 160 7% 20%;
+    --input: 160 7% 20%;
+    --primary: 151 66% 64%;
+    --primary-foreground: 160 15% 8%;
+    --ring: 151 66% 64%;
+    --accent: 160 7% 16%;
+    --accent-foreground: 150 10% 96%;
+  }
+  .workspace-nav-link {
+    @apply inline-flex min-h-11 items-center rounded-full px-4 text-sm font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground;
+  }
+  .workspace-nav-link[aria-current="page"] {
+    @apply bg-primary/10 text-primary;
+  }
+  .workspace-shell :is(a, button, summary, input, select, textarea):focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 3px;
+  }
+  .workspace-shell a, .workspace-shell button {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-shell *, .workspace-shell *::before, .workspace-shell *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Marketing landing (V2) responsive collapse. The landing uses inline styles
+   for its premium dark treatment; these few rules collapse its multi-column
+   grids and trim the nav on narrow screens (matches the design prototype). */
+@media (max-width: 900px) {
+  .mm-hero-grid,
+  .mm-pillars,
+  .mm-seo-grid,
+  .mm-market-page-grid,
+  .mm-workflow-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .mm-surface-grid {
+    grid-template-columns: 1fr 1fr !important;
+  }
+  .mm-surface-grid > * {
+    grid-column: span 1 !important;
+  }
+  .mm-workflow-grid > li {
+    min-height: 0 !important;
+  }
+  .mm-workflow-arrow {
+    display: none !important;
+  }
+  /* Resource hub: 3 cols → 2 on tablet. */
+  .mm-resource-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+}
+@media (max-width: 640px) {
+  .mm-resource-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .mm-surface-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+.mm-workflow-arrow {
+  position: absolute;
+  top: 21px;
+  right: -12px;
+  z-index: 2;
+  color: var(--mm-text-faint);
+  font-size: 14px;
+}
+/* Mobile hamburger (marketing nav) + sticky bottom CTA: hidden on desktop,
+   shown below 640px exactly where the inline desktop nav links collapse. */
+.mm-mobile-nav {
+  display: none;
+}
+.mm-sticky-cta {
+  display: none;
+}
+@media (max-width: 640px) {
+  .mm-nav-links {
+    display: none !important;
+  }
+  .mm-mobile-nav {
+    display: inline-flex !important;
+  }
+  .mm-sticky-cta {
+    display: flex !important;
+  }
+}
+
+/* Linked marketing cards (content pages) — subtle teal hover. The cards carry
+   inline marketing-palette styles; these !important rules layer the hover on
+   top without pulling the whole card into Tailwind classes. */
+.mm-card {
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease,
+    transform 0.2s ease;
+}
+.mm-card:hover {
+  border-color: rgba(47, 167, 188, 0.45) !important;
+  background: rgba(255, 255, 255, 0.05) !important;
+}

@@ -1,0 +1,51 @@
+# compose.aws.yml
+#
+# Caddy-only reverse proxy for the EC2 split stack. The legacy Streamlit `app`
+# service was RETIRED 2026-06-23 (see CLAUDE.md §1B): the backend no longer
+# depends on Streamlit, the /legacy routes were dropped from ./Caddyfile, and
+# the `app` container was removed. This file used to define `app` + `caddy`;
+# now it is just the TLS terminator / reverse proxy that fronts the GHCR-pulled
+# backend + frontend defined in compose.split.yml.
+#
+#   - Caddy terminates TLS via Let's Encrypt (HTTP-01) and reverse-proxies
+#     /api/v1/* → backend:8000 and / → frontend:3000 (see ./Caddyfile).
+#   - awslogs ships caddy stdout to the /mindmarket/caddy CloudWatch group.
+#   - systemd (mindmarket.service) brings this up with `--no-build` on boot,
+#     after the split backend+frontend. NEVER build on the box (916MB → OOM).
+
+services:
+  caddy:
+    # Pinned to the 2.11 minor — the ingress must not auto-upgrade on a pull/
+    # recreate: a caddy-version-sensitive Caddyfile parse difference already
+    # crash-looped prod on the 2026-06-20 reboot. CI validates ./Caddyfile
+    # against this same image (ci.yml `validate-config`); bump the pin
+    # deliberately, together with that job.
+    image: caddy:2.11-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - SITE_HOST=${SITE_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./assets/brand:/srv/brand:ro
+      - ./assets/seo:/srv/seo:ro
+      # Cloudflare Origin CA cert + key (host-only, NEVER in git) — consumed
+      # by the Caddyfile's `tls` directive. See docs/aws/cloudflare-setup.md
+      # Step 3; instance rebuild: re-download from Cloudflare → SSL/TLS →
+      # Origin Server (or re-create, free).
+      - /srv/tls:/srv/tls:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: us-east-1
+        awslogs-group: /mindmarket/caddy
+        awslogs-stream: caddy
+        awslogs-create-group: "true"
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,129 @@
+"use client";
+
+/**
+ * AI Portfolio Copilot — the full-page chat.
+ *
+ * This route is a thin shell: an auth gate (same client-side pattern as
+ * /portfolios — skeleton while the Supabase session probes, redirect to
+ * /login when signed out) + a header, wrapped around the shared
+ * <CopilotConversation /> that owns ALL the chat logic. The exact same
+ * conversation component powers the app-wide floating widget, so there
+ * is a single source of truth for message-state, send logic, grounded
+ * answers, foreground risk checks, explicit waiting states and friendly errors.
+ */
+
+import { Suspense, useEffect } from "react";
+import Link from "next/link";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { CopilotConversation } from "@/components/copilot-conversation";
+import { CopilotInsightsStrip } from "@/components/copilot-insights";
+import { CopilotPreferencesCard } from "@/components/copilot-preferences";
+import { CreditsBadge } from "@/components/credits-badge";
+import { isBillingEnabled } from "@/lib/billing-flag";
+import { useAuth } from "@/lib/auth-context";
+import { authHref } from "@/lib/auth-redirect";
+import { useBillingMe } from "@/lib/queries";
+
+export default function CopilotPage() {
+  const router = useRouter();
+  const { user, loading: authLoading, configured } = useAuth();
+  const billing = useBillingMe();
+
+  useEffect(() => {
+    if (!configured) return;
+    if (!authLoading && !user) {
+      router.replace(authHref("/login", "/copilot"));
+    }
+  }, [user, authLoading, configured, router]);
+
+  if (!configured) {
+    return <PreviewBuildNotice />;
+  }
+
+  if (authLoading || !user) {
+    return <PageSkeleton />;
+  }
+
+  const planLabel = billing.data?.plan;
+
+  return (
+    <div className="mx-auto flex max-w-3xl flex-col gap-6">
+      <header className="space-y-2">
+        <p className="text-xs font-medium uppercase tracking-widest text-primary">Understand the why</p>
+        <div className="flex items-center gap-2">
+          <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">
+            Portfolio Copilot
+          </h1>
+          {isBillingEnabled() && planLabel && (
+            <span className="rounded-full border border-border bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              {planLabel}
+            </span>
+          )}
+        </div>
+        <p className="text-sm text-muted-foreground">
+          Ask anything about your portfolio in plain English. Your Copilot
+          explains the risk first — the hard numbers are always one tap away.
+        </p>
+        <CreditsBadge />
+      </header>
+
+      <CopilotInsightsStrip />
+
+      <Suspense fallback={<Skeleton className="h-40 w-full" />}>
+        <CopilotWithPrefill />
+      </Suspense>
+
+      <CopilotPreferencesCard />
+    </div>
+  );
+}
+
+/** Reads ?q= (e.g. the Research → Copilot handoff) to prefill the ask box. */
+function CopilotWithPrefill() {
+  const params = useSearchParams();
+  const q = params.get("q") ?? undefined;
+  return <CopilotConversation variant="page" initialQuestion={q} />;
+}
+
+function PreviewBuildNotice() {
+  return (
+    <Card className="mx-auto max-w-2xl">
+      <CardHeader>
+        <CardTitle>Sign in to use the Copilot</CardTitle>
+        <CardDescription>
+          The Copilot answers questions about your own portfolio.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        {/* Dev-only: this build lacks the NEXT_PUBLIC_SUPABASE_* env vars.
+            Real deployments always set them, so end users never see this. */}
+        <p className="text-muted-foreground">
+          Accounts aren&apos;t available on this preview build. You can still try
+          the public demo below.
+        </p>
+        <Link href="/score">
+          <Button variant="outline">Try the public /score demo</Button>
+        </Link>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PageSkeleton() {
+  return (
+    <div className="mx-auto max-w-3xl space-y-6">
+      <Skeleton className="h-8 w-56" />
+      <Skeleton className="h-40 w-full" />
+      <Skeleton className="h-16 w-full" />
+    </div>
+  );
+}

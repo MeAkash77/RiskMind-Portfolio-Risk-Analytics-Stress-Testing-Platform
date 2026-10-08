@@ -1,0 +1,127 @@
+# .github/workflows/build-images.yml
+#
+# Off-box image builds for the split stack (frontend + backend).
+#
+# WHY: the EC2 box is a t3.micro (~916 MB RAM). Running `next build` / a
+# docker build ON it OOM-thrashes the instance and has taken the site down
+# (2026-05-31 incident). GitHub's runners have ~7 GB RAM, so we build the
+# images HERE, push them to GHCR, and EC2 only ever `docker compose pull`s
+# them — zero build load on the box.
+#
+# Images:  ghcr.io/<owner>/mindmarket-frontend  +  -backend
+# Tags:    latest  +  <git-sha>   (pull a specific sha via MM_IMAGE_TAG on EC2)
+#
+# ── ONE-TIME SETUP (owner — the workflow can't do these) ──────────────
+#  1. Repo → Settings → Secrets and variables → Actions → **Variables**,
+#     add (same values as the EC2 .env — all NEXT_PUBLIC_*, publishable):
+#       NEXT_PUBLIC_API_BASE_URL      e.g. https://mindmarket.app
+#       NEXT_PUBLIC_SUPABASE_URL      https://<project>.supabase.co
+#       NEXT_PUBLIC_SUPABASE_ANON_KEY sb_publishable_...
+#       NEXT_PUBLIC_SENTRY_DSN        https://<public-key>@.../project-id
+#       NEXT_PUBLIC_BILLING_ENABLED   "false" for the free beta (hides billing UI);
+#                                     omit/anything else = billing UI enabled
+#     (Set these BEFORE relying on the frontend image — an unset value
+#      bakes an empty URL into the bundle → "Supabase not configured".)
+#  2. On EC2, one-time, so `docker compose pull` can read private GHCR:
+#       echo <PAT_with_read:packages> | docker login ghcr.io -u <owner> --password-stdin
+#     (Create the PAT at GitHub → Settings → Developer settings → tokens.)
+
+name: Build & push images (GHCR)
+
+on:
+  push:
+    branches: [main]
+    # The backend image bundles the WHOLE repo (`COPY . /app` in the backend
+    # Dockerfile) — so any root-level legacy module the backend imports
+    # (regime_detector.py, portfolio_config.py, volatility_scanner.py, …)
+    # affects the image. An allowlist silently MISSED those (a change to
+    # regime_detector.py triggered no build → a silent no-deploy, 2026-06-20).
+    # Invert to a denylist: build on every push to main EXCEPT pure docs and the
+    # Caddy-served static assets (those deploy via `git pull` on the box, not the
+    # image). A redundant build on a docs-adjacent code change is cheap + safe; a
+    # silent no-deploy is not.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'assets/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize builds per ref — two rapid pushes to main otherwise RACE on the
+# `latest` tag (whichever run finishes LAST wins, possibly the older commit;
+# the reboot path pulls `latest`, so a stale winner could silently roll prod
+# back on next boot). cancel-in-progress stays FALSE deliberately: cancelling
+# a run mid-flight can kill one of the two independent jobs after the other
+# already pushed, leaving a sha-<full> tag that exists for only ONE image —
+# which breaks pinned MM_IMAGE_TAG deploys/rollbacks. Serialized runs always
+# finish both tags; a superseded PENDING run is still replaced by the newest
+# (backfill a skipped sha with `gh workflow run build-images.yml` if needed).
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mindmarket-frontend
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_BASE_URL=${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+            NEXT_PUBLIC_SUPABASE_URL=${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ vars.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+            NEXT_PUBLIC_SENTRY_DSN=${{ vars.NEXT_PUBLIC_SENTRY_DSN }}
+            NEXT_PUBLIC_COPILOT_RUNS_ENABLED=${{ vars.NEXT_PUBLIC_COPILOT_RUNS_ENABLED }}
+            NEXT_PUBLIC_PUBLIC_RISK_CHECK=${{ vars.NEXT_PUBLIC_PUBLIC_RISK_CHECK }}
+            NEXT_PUBLIC_BILLING_ENABLED=${{ vars.NEXT_PUBLIC_BILLING_ENABLED }}
+
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mindmarket-backend
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

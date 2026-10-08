@@ -1,0 +1,22 @@
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+
+# Code quality
+black>=24.3.0
+ruff>=0.3.0
+mypy>=1.9.0
+pre-commit>=3.6.0
+# Dependency vulnerability scanning (advisory CI job + scripts/ci_checks.sh).
+pip-audit>=2.7.0
+
+# Type stubs
+types-requests
+pandas-stubs
+
+# NOTE: streamlit / extra-streamlit-components / fpdf2 were fully removed
+# 2026-06-23 (Streamlit retirement, CLAUDE.md §1B). The legacy tests/ that touch
+# Streamlit-coupled libs/ MOCK streamlit via monkeypatch (sys.modules), so the
+# real package is no longer needed even for the test suite; the only module that
+# genuinely needed fpdf2 (libs/analysis/equity_pdf) was deleted with its test.

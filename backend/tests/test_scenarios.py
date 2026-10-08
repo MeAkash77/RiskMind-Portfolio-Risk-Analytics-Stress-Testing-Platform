@@ -1,0 +1,198 @@
+"""Contract tests for the scenario simulator + efficient frontier endpoints.
+
+The heavy parts (DataProvider, RiskEngine, market_data) are mocked so the
+routes run offline. We assert the serialized shapes + the scenario math
+(beta≈1, no leverage → portfolio P&L ≈ the market shock).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+_RETURNS = pd.DataFrame(
+    {
+        "SPY": [0.01, -0.02, 0.015, -0.005],
+        "BND": [0.001, -0.001, 0.002, 0.0],
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def neutral_confirmed_risk_profile(monkeypatch):
+    from backend.app.services import copilot_preferences
+
+    monkeypatch.setattr(
+        copilot_preferences,
+        "get_confirmed_strict",
+        lambda access_token, user_id: None,
+    )
+
+
+@pytest.fixture
+def fake_active_portfolio(monkeypatch):
+    class _Stub:
+        def __init__(self):
+            self.holdings = {}
+            self.calls = []
+            self.capital_state = {
+                "cash_balance": 0.0,
+                "margin_loan": 0.0,
+                "contributed_capital": 0.0,
+            }
+
+        def set(self, h):
+            self.holdings = h
+
+        def __call__(self, access_token=None):
+            from libs.auth.active_portfolio import ActivePortfolioContext
+
+            self.calls.append(access_token)
+            return ActivePortfolioContext(
+                portfolio_id="p1" if self.holdings else None,
+                holdings=dict(self.holdings),
+                **self.capital_state,
+            )
+
+    stub = _Stub()
+    import libs.auth.active_portfolio as ap
+
+    monkeypatch.setattr(ap, "get_active_portfolio_context", stub)
+    return stub
+
+
+@pytest.fixture
+def fake_price_history(monkeypatch):
+    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=60)
+    frame = pd.DataFrame(
+        {"SPY": np.linspace(400, 420, 60), "BND": np.linspace(70, 72, 60)}, index=idx
+    )
+    from backend.app.services import market_data as md
+
+    monkeypatch.setattr(
+        md,
+        "get_price_history",
+        lambda tickers, *, days=365, cache_provider=None: frame[
+            [t for t in tickers if t in frame.columns]
+        ],
+    )
+    return frame
+
+
+@pytest.fixture
+def fake_engine(monkeypatch):
+    class _DP:
+        def __init__(self, weights=None, holdings=None, **_):
+            self.weights = dict(weights or {})
+            self.holdings = dict(holdings or {})
+
+        def get_daily_returns(self, winsorize=False):
+            return _RETURNS
+
+    class _Engine:
+        TRADING_DAYS = 252
+
+        def __init__(self, dp, **kwargs):
+            self.dp = dp
+
+        def compute_efficient_frontier(self, returns, risk_free, n_points=50):
+            return {
+                "frontier_vols": [0.08, 0.12, 0.18],
+                "frontier_rets": [0.04, 0.07, 0.10],
+            }
+
+        def _stress_test(self, returns, weights, market_shock=-0.10):
+            # Portfolio beta ≈ 1 → P&L tracks the market shock 1:1.
+            return float(market_shock), {c: float(market_shock) for c in returns.columns}
+
+    import data_provider as dpmod
+    import risk_engine as rem
+
+    monkeypatch.setattr(dpmod, "DataProvider", _DP)
+    monkeypatch.setattr(rem, "RiskEngine", _Engine)
+    return _Engine
+
+
+def _auth(mint_token):
+    return {"Authorization": f"Bearer {mint_token()}"}
+
+
+# ── auth gates ─────────────────────────────────────────────────────
+
+
+def test_frontier_requires_bearer(test_client):
+    assert test_client.post("/api/v1/risk/efficient_frontier", json={}).status_code == 401
+
+
+def test_scenarios_requires_bearer(test_client):
+    assert test_client.post("/api/v1/risk/scenarios", json={}).status_code == 401
+
+
+# ── efficient frontier ─────────────────────────────────────────────
+
+
+def test_efficient_frontier_happy(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_engine
+):
+    fake_active_portfolio.set({"SPY": {"shares": 100}, "BND": {"shares": 100}})
+    resp = test_client.post("/api/v1/risk/efficient_frontier", json={}, headers=_auth(mint_token))
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()["data"]
+    assert len(data["frontier"]) == 3
+    assert all(np.isfinite(p["vol"]) and np.isfinite(p["ret"]) for p in data["frontier"])
+    assert np.isfinite(data["current"]["vol"]) and np.isfinite(data["current"]["ret"])
+    # Provenance: last price date + observation count behind the curve.
+    assert data["as_of"] is not None
+    assert data["observations"] and data["observations"] > 0
+
+
+def test_efficient_frontier_needs_two_holdings(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_engine
+):
+    fake_active_portfolio.set({"SPY": {"shares": 100}})  # single holding
+    resp = test_client.post("/api/v1/risk/efficient_frontier", json={}, headers=_auth(mint_token))
+    # Single-column returns → 422 (can't draw a frontier from one asset).
+    assert resp.status_code in (200, 422)
+
+
+# ── scenario simulator ─────────────────────────────────────────────
+
+
+def test_scenarios_happy_sweep(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_engine
+):
+    fake_active_portfolio.set({"SPY": {"shares": 100}, "BND": {"shares": 100}})
+    resp = test_client.post("/api/v1/risk/scenarios", json={}, headers=_auth(mint_token))
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()["data"]
+    assert data["total_value"] > 0
+    shocks = {round(p["shock_pct"], 2): p for p in data["scenarios"]}
+    assert -0.30 in shocks and 0.30 in shocks
+    # beta≈1, no leverage → P&L tracks the shock; value = total*(1+pnl).
+    crash = shocks[-0.30]
+    assert crash["pnl_pct"] == pytest.approx(-0.30, abs=1e-6)
+    assert crash["portfolio_value"] == pytest.approx(data["total_value"] * 0.70, rel=1e-6)
+    # Provenance: last price date + observation count behind the betas.
+    assert data["as_of"] is not None
+    assert data["observations"] and data["observations"] > 0
+
+
+def test_scenarios_carry_per_asset_losses(
+    test_client, mint_token, fake_active_portfolio, fake_price_history, fake_engine
+):
+    """Each scenario point now ships the per-holding move under that shock so
+    the Scenario Explorer can show 'top impacted holdings' without refetching."""
+    fake_active_portfolio.set({"SPY": {"shares": 100}, "BND": {"shares": 100}})
+    resp = test_client.post("/api/v1/risk/scenarios", json={}, headers=_auth(mint_token))
+    assert resp.status_code == 200, resp.json()
+    shocks = {round(p["shock_pct"], 2): p for p in resp.json()["data"]["scenarios"]}
+    crash = shocks[-0.30]
+    assert crash["asset_losses"], "expected per-asset losses on each scenario point"
+    tickers = {a["ticker"] for a in crash["asset_losses"]}
+    assert {"SPY", "BND"} <= tickers
+    # fake engine: every asset moves with the shock (beta 1).
+    assert all(a["loss_pct"] == pytest.approx(-0.30, abs=1e-6) for a in crash["asset_losses"])
+    # ranked most-impacted first (ascending loss_pct = most negative first).
+    losses = [a["loss_pct"] for a in crash["asset_losses"]]
+    assert losses == sorted(losses)

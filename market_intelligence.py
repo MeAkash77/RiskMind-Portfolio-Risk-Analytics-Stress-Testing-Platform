@@ -1,0 +1,3042 @@
+"""
+market_intelligence.py
+Market intelligence module v2.0
+──────────────────────────────────────────────────────────
+Features:
+  1. International macro news aggregation (RSS + yfinance)
+  2. Holdings fundamentals (P/E, market cap, EPS, dividend yield, etc.)
+  3. VIX fear index & yield curve
+  4. AI comprehensive risk briefing generation
+  5. CNN Fear & Greed Index
+  6. Insider Trading + Technical Signals
+  7. Reddit retail sentiment (Apify)
+  8. FMP earnings-call transcripts + Claude deep analysis
+"""
+
+import logging
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Shared HTTP session with automatic retry + backoff
+# ──────────────────────────────────────────────────────────────
+#  Used by every FMP/external call in this module. Exponential
+#  backoff on 429 (rate limit) and transient 5xx — so the user
+#  no longer sees "too many requests" bubble up on a single
+#  unlucky request. Connection pooling also saves ~50ms/call.
+# ══════════════════════════════════════════════════════════════
+
+
+def _build_http_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=2,
+        backoff_factor=0.5,  # 0 → 0.5s → 1s (transient 5xx only)
+        # Do NOT retry 429. When FMP's quota is exhausted EVERY call 429s, and
+        # retrying (with backoff + a possible `Retry-After: 60`) stalls each call
+        # for 10s–180s — across ~20 calls per research bundle that's minutes, so
+        # the page "never loads". A 429 now fails fast and the caller drops to the
+        # free-yfinance fallback immediately. Only transient 5xx are retried.
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        respect_retry_after_header=False,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "MindMarketAI/1.0"})
+    return s
+
+
+_http_session = _build_http_session()
+
+
+# ══════════════════════════════════════════════════════════════
+#  1. International macro news aggregation
+# ══════════════════════════════════════════════════════════════
+
+# RSS feed list: covers the Fed, global macro, and geopolitics
+MACRO_RSS_FEEDS = {
+    "Reuters Business": "https://www.rss.app/feeds/v1.1/tgSjPfjTQYNME2cZ.json",
+    "CNBC Economy": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258",
+    "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "FT Markets": "https://www.ft.com/rss/home",
+    "Bloomberg Markets": "https://feeds.bloomberg.com/markets/news.rss",
+}
+
+
+def _fetch_single_rss(
+    source_name: str, url: str, per_source_limit: int, timeout: int
+) -> List[Dict]:
+    """Fetch a single RSS feed. Called concurrently by fetch_macro_news_rss."""
+    items_out = []
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; PortfolioRisk/1.0)"},
+        )
+        if resp.status_code != 200:
+            return items_out
+
+        content_type = resp.headers.get("Content-Type", "")
+
+        # JSON feed (rss.app format)
+        if "json" in url or "json" in content_type:
+            data = resp.json()
+            items = data.get("items", [])
+            for item in items[:per_source_limit]:
+                items_out.append(
+                    {
+                        "source": source_name,
+                        "title": item.get("title", "").strip(),
+                        "link": item.get("url", item.get("link", "")),
+                        "published": item.get("date_published", item.get("pubDate", "")),
+                        "summary": (item.get("content_text", "") or item.get("summary", ""))[:200],
+                    }
+                )
+        else:
+            # XML RSS parsing (lightweight, no feedparser dependency)
+            items = _parse_rss_xml(resp.text, per_source_limit)
+            for item in items:
+                item["source"] = source_name
+                items_out.append(item)
+
+    except Exception:
+        pass
+
+    return items_out
+
+
+def fetch_macro_news_rss(max_items: int = 30, timeout: int = 8) -> List[Dict]:
+    """
+    Fetch global macro news from multiple RSS feeds.
+    Returns [{source, title, link, published, summary}] sorted newest-first.
+    Uses ThreadPoolExecutor to fetch all RSS feeds concurrently.
+    """
+    all_items = []
+    per_source_limit = max_items // len(MACRO_RSS_FEEDS)
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(
+                _fetch_single_rss, source_name, url, per_source_limit, timeout
+            ): source_name
+            for source_name, url in MACRO_RSS_FEEDS.items()
+        }
+        for future in as_completed(futures):
+            try:
+                all_items.extend(future.result())
+            except Exception:
+                continue
+
+    # Sort by time (newest first)
+    all_items.sort(key=lambda x: x.get("published", ""), reverse=True)
+    return all_items[:max_items]
+
+
+def _parse_rss_xml(xml_text: str, max_items: int = 10) -> List[Dict]:
+    """Simple XML RSS parsing, no external libraries required."""
+    items = []
+    # Match <item> or <entry> blocks
+    item_pattern = re.compile(r"<(?:item|entry)>(.*?)</(?:item|entry)>", re.DOTALL)
+    title_pattern = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL)
+    link_pattern = re.compile(
+        r'<link[^>]*(?:href=["\']([^"\']+)["\'])?[^>]*>(.*?)</link>', re.DOTALL
+    )
+    pub_pattern = re.compile(
+        r"<(?:pubDate|published|updated)[^>]*>(.*?)</(?:pubDate|published|updated)>", re.DOTALL
+    )
+    desc_pattern = re.compile(
+        r"<(?:description|summary|content)[^>]*>(.*?)</(?:description|summary|content)>", re.DOTALL
+    )
+
+    for match in item_pattern.finditer(xml_text)[:max_items]:
+        block = match.group(1)
+
+        title_m = title_pattern.search(block)
+        title = _strip_cdata(title_m.group(1)) if title_m else ""
+
+        link_m = link_pattern.search(block)
+        link = ""
+        if link_m:
+            link = link_m.group(1) or link_m.group(2) or ""
+        link = link.strip()
+
+        pub_m = pub_pattern.search(block)
+        published = pub_m.group(1).strip() if pub_m else ""
+
+        desc_m = desc_pattern.search(block)
+        summary = _strip_cdata(desc_m.group(1))[:200] if desc_m else ""
+        # Strip HTML tags
+        summary = re.sub(r"<[^>]+>", "", summary).strip()
+
+        items.append(
+            {
+                "title": title,
+                "link": link,
+                "published": published,
+                "summary": summary,
+            }
+        )
+
+    return items
+
+
+def _strip_cdata(text: str) -> str:
+    """Strip the CDATA wrapper."""
+    text = re.sub(r"<!\[CDATA\[", "", text)
+    text = re.sub(r"\]\]>", "", text)
+    return text.strip()
+
+
+def fetch_yfinance_market_news(max_items: int = 10) -> List[Dict]:
+    """
+    Fetch market-level news via yfinance (SPY/^GSPC news is usually macro in nature).
+    """
+    items = []
+    for symbol in ["SPY", "^GSPC", "^VIX"]:
+        try:
+            ticker = yf.Ticker(symbol)
+            news = ticker.news or []
+            for n in news[: max_items // 3]:
+                content = n.get("content", {})
+                title = content.get("title") or n.get("title", "")
+                if title:
+                    items.append(
+                        {
+                            "source": f"Yahoo Finance ({symbol})",
+                            "title": title.strip(),
+                            "link": content.get("canonicalUrl", {}).get("url", ""),
+                            "published": content.get("pubDate", ""),
+                            "summary": content.get("summary", "")[:200],
+                        }
+                    )
+        except Exception:
+            continue
+    return items
+
+
+def get_all_macro_news(max_items: int = 30) -> List[Dict]:
+    """Merge all macro news sources."""
+    rss_news = fetch_macro_news_rss(max_items=max_items)
+    yf_news = fetch_yfinance_market_news(max_items=10)
+
+    # Deduplicate (by the first 40 characters of the title)
+    seen = set()
+    merged = []
+    for item in rss_news + yf_news:
+        key = item["title"][:40].lower()
+        if key not in seen and item["title"]:
+            seen.add(key)
+            merged.append(item)
+
+    return merged[:max_items]
+
+
+# ══════════════════════════════════════════════════════════════
+#  2. Holdings fundamentals
+# ══════════════════════════════════════════════════════════════
+
+FUNDAMENTAL_FIELDS = {
+    "marketCap": "Market Cap",
+    "trailingPE": "P/E (TTM)",
+    "forwardPE": "P/E (Fwd)",
+    "trailingEps": "EPS (TTM)",
+    "forwardEps": "EPS (Fwd)",
+    "dividendYield": "Div Yield",
+    "revenueGrowth": "Rev Growth",
+    "earningsGrowth": "Earn Growth",
+    "profitMargins": "Profit Margin",
+    "returnOnEquity": "ROE",
+    "debtToEquity": "D/E Ratio",
+    "currentRatio": "Current Ratio",
+    "beta": "Beta (5Y)",
+    "fiftyTwoWeekHigh": "52W High",
+    "fiftyTwoWeekLow": "52W Low",
+    "averageVolume": "Avg Volume",
+}
+
+
+def _fetch_single_fundamental(tk: str) -> Optional[tuple]:
+    """Fetch fundamentals for a single ticker. Returns (ticker, row_dict) or None."""
+    if tk.endswith("-USD"):
+        return None
+    try:
+        info = yf.Ticker(tk).info or {}
+        row = {}
+        for field, label in FUNDAMENTAL_FIELDS.items():
+            val = info.get(field)
+            row[label] = val
+        # Extra calculation: drawdown from the 52-week high
+        high = info.get("fiftyTwoWeekHigh")
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if high and price and high > 0:
+            row["% from 52W High"] = (price - high) / high
+        return (tk, row)
+    except Exception:
+        return None
+
+
+def fetch_fundamentals(tickers: List[str]) -> pd.DataFrame:
+    """
+    Batch-fetch fundamentals for the holdings.
+    Returns a DataFrame: index=ticker, columns=fundamental metrics.
+    Skips cryptocurrencies (-USD suffix).
+    Uses ThreadPoolExecutor to fetch all tickers in parallel.
+    """
+    rows = {}
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_single_fundamental, tk): tk for tk in tickers}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    tk, row = result
+                    rows[tk] = row
+            except Exception:
+                continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame.from_dict(rows, orient="index")
+    df.index.name = "Ticker"
+    return df
+
+
+def format_fundamentals_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Format the fundamentals data for UI display."""
+    if df.empty:
+        return df
+
+    display = df.copy()
+
+    # Format specific columns
+    fmt_pct = ["Div Yield", "Rev Growth", "Earn Growth", "Profit Margin", "ROE", "% from 52W High"]
+    fmt_ratio = ["P/E (TTM)", "P/E (Fwd)", "Beta (5Y)", "D/E Ratio", "Current Ratio"]
+    fmt_dollar = ["EPS (TTM)", "EPS (Fwd)", "52W High", "52W Low"]
+
+    for col in fmt_pct:
+        if col in display.columns:
+            display[col] = display[col].apply(
+                lambda x: f"{x:.1%}" if pd.notna(x) and isinstance(x, (int, float)) else "—"
+            )
+
+    for col in fmt_ratio:
+        if col in display.columns:
+            display[col] = display[col].apply(
+                lambda x: f"{x:.2f}" if pd.notna(x) and isinstance(x, (int, float)) else "—"
+            )
+
+    for col in fmt_dollar:
+        if col in display.columns:
+            display[col] = display[col].apply(
+                lambda x: f"${x:.2f}" if pd.notna(x) and isinstance(x, (int, float)) else "—"
+            )
+
+    if "Market Cap" in display.columns:
+        display["Market Cap"] = display["Market Cap"].apply(_fmt_market_cap)
+
+    if "Avg Volume" in display.columns:
+        display["Avg Volume"] = display["Avg Volume"].apply(
+            lambda x: f"{x/1e6:.1f}M" if pd.notna(x) and isinstance(x, (int, float)) else "—"
+        )
+
+    return display
+
+
+def _fmt_market_cap(val) -> str:
+    """Format the market cap as a human-readable string."""
+    if pd.isna(val) or not isinstance(val, (int, float)):
+        return "—"
+    if val >= 1e12:
+        return f"${val/1e12:.2f}T"
+    elif val >= 1e9:
+        return f"${val/1e9:.1f}B"
+    elif val >= 1e6:
+        return f"${val/1e6:.0f}M"
+    return f"${val:,.0f}"
+
+
+# ══════════════════════════════════════════════════════════════
+#  3. VIX fear index & yield curve
+# ══════════════════════════════════════════════════════════════
+
+
+def _fetch_vix_data_uncached(period: str = "1y") -> pd.DataFrame:
+    """Raw VIX history fetcher (no caching)."""
+    try:
+        vix = yf.download("^VIX", period=period, auto_adjust=True, progress=False)
+        if isinstance(vix.columns, pd.MultiIndex):
+            vix = vix.droplevel(1, axis=1) if vix.columns.nlevels > 1 else vix
+        if "Close" not in vix.columns:
+            # The column may be named after the ticker
+            vix.columns = ["Open", "High", "Low", "Close", "Volume"][: len(vix.columns)]
+
+        df = pd.DataFrame(
+            {
+                "VIX": vix["Close"].values,
+            },
+            index=vix.index,
+        )
+
+        df["VIX_MA20"] = df["VIX"].rolling(20).mean()
+        df["VIX_MA50"] = df["VIX"].rolling(50).mean()
+        return df.dropna(subset=["VIX"])
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_vix_data(period: str = "1y") -> pd.DataFrame:
+    """VIX history with 10-minute cache (Streamlit-aware).
+
+    Why: Markets page auto-loads VIX/yield/F&G on first visit; without a
+    cache every widget rerun re-hits yfinance (~1-2s each call).
+    """
+    try:
+        import streamlit as _st  # type: ignore
+
+        @_st.cache_data(ttl=600, show_spinner=False)
+        def _cached(p: str) -> pd.DataFrame:
+            return _fetch_vix_data_uncached(p)
+
+        return _cached(period)
+    except Exception:
+        return _fetch_vix_data_uncached(period)
+
+
+def _get_vix_current_uncached() -> Dict:
+    """Raw VIX current fetcher (no caching)."""
+    try:
+        tk = yf.Ticker("^VIX")
+        info = tk.info or {}
+        hist = tk.history(period="5d")
+
+        current = info.get("regularMarketPrice") or info.get("previousClose")
+        if current is None and not hist.empty:
+            current = float(hist["Close"].iloc[-1])
+
+        prev_close = info.get("previousClose")
+        if prev_close is None and len(hist) > 1:
+            prev_close = float(hist["Close"].iloc[-2])
+
+        change = (current - prev_close) / prev_close if current and prev_close else None
+
+        # VIX level classification
+        if current is None:
+            level = "N/A"
+            level_icon = "⚪"
+        elif current < 15:
+            level = "Low (Complacency)"
+            level_icon = "🟢"
+        elif current < 20:
+            level = "Normal"
+            level_icon = "🟢"
+        elif current < 25:
+            level = "Elevated"
+            level_icon = "🟡"
+        elif current < 30:
+            level = "High"
+            level_icon = "🟠"
+        elif current < 40:
+            level = "Very High (Fear)"
+            level_icon = "🔴"
+        else:
+            level = "Extreme (Panic)"
+            level_icon = "🔴"
+
+        return {
+            "current": current,
+            "prev_close": prev_close,
+            "change": change,
+            "level": level,
+            "level_icon": level_icon,
+        }
+    except Exception:
+        return {"current": None, "level": "N/A", "level_icon": "⚪", "change": None}
+
+
+def get_vix_current() -> Dict:
+    """Current VIX value/level with 10-minute cache (Streamlit-aware)."""
+    try:
+        import streamlit as _st  # type: ignore
+
+        @_st.cache_data(ttl=600, show_spinner=False)
+        def _cached() -> Dict:
+            return _get_vix_current_uncached()
+
+        return _cached()
+    except Exception:
+        return _get_vix_current_uncached()
+
+
+# Key maturities of the US Treasury yield curve
+YIELD_CURVE_TICKERS = {
+    "^IRX": "3M",  # 3-month T-Bill
+    "^FVX": "5Y",  # 5-year
+    "^TNX": "10Y",  # 10-year
+    "^TYX": "30Y",  # 30-year
+}
+
+# A fuller yield curve (via FRED or yfinance)
+YIELD_TICKERS_FULL = {
+    "^IRX": ("3M", 0.25),
+    "^FVX": ("5Y", 5.0),
+    "^TNX": ("10Y", 10.0),
+    "^TYX": ("30Y", 30.0),
+}
+
+
+def _fetch_yield_curve_uncached() -> Tuple[pd.DataFrame, Dict]:
+    """Raw yield-curve fetcher (no caching)."""
+    tickers = list(YIELD_TICKERS_FULL.keys())
+
+    try:
+        # Download 90 days of data
+        raw = yf.download(
+            tickers,
+            period="90d",
+            auto_adjust=True,
+            progress=False,
+        )
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            close = raw["Close"]
+            if isinstance(close.columns, pd.MultiIndex):
+                close = close.droplevel(0, axis=1)
+        else:
+            close = raw
+
+        close = close.ffill().dropna(how="all")
+
+        if close.empty:
+            return pd.DataFrame(), {}
+
+        # Current yields
+        current = close.iloc[-1]
+        # 30 days ago
+        idx_30d = max(0, len(close) - 22)
+        month_ago = close.iloc[idx_30d]
+        # 90 days ago
+        quarter_ago = close.iloc[0]
+
+        rows = []
+        for tk, (label, years) in YIELD_TICKERS_FULL.items():
+            if tk in current.index:
+                rows.append(
+                    {
+                        "Maturity": label,
+                        "Years": years,
+                        "Current (%)": float(current.get(tk, np.nan)),
+                        "30d Ago (%)": float(month_ago.get(tk, np.nan)),
+                        "90d Ago (%)": float(quarter_ago.get(tk, np.nan)),
+                    }
+                )
+
+        curve_df = pd.DataFrame(rows)
+
+        # Analysis
+        analysis = {}
+        c3m = current.get("^IRX")
+        c10y = current.get("^TNX")
+        c30y = current.get("^TYX")
+
+        if c3m is not None and c10y is not None:
+            spread_3m_10y = float(c10y - c3m)
+            analysis["3M-10Y Spread"] = spread_3m_10y
+            analysis["inverted_3m_10y"] = spread_3m_10y < 0
+
+        if c10y is not None and c30y is not None:
+            spread_10y_30y = float(c30y - c10y)
+            analysis["10Y-30Y Spread"] = spread_10y_30y
+
+        if c3m is not None and c10y is not None:
+            if spread_3m_10y < -0.5:
+                analysis["curve_status"] = "Deeply Inverted"
+                analysis["curve_icon"] = "🔴"
+            elif spread_3m_10y < 0:
+                analysis["curve_status"] = "Inverted"
+                analysis["curve_icon"] = "🟠"
+            elif spread_3m_10y < 0.5:
+                analysis["curve_status"] = "Flat"
+                analysis["curve_icon"] = "🟡"
+            else:
+                analysis["curve_status"] = "Normal (Steep)"
+                analysis["curve_icon"] = "🟢"
+
+        return curve_df, analysis
+
+    except Exception:
+        return pd.DataFrame(), {}
+
+
+def fetch_yield_curve() -> Tuple[pd.DataFrame, Dict]:
+    """US Treasury yield curve with 10-minute cache (Streamlit-aware).
+
+    Returns (DataFrame, analysis dict). 10-min TTL is conservative — the
+    curve barely moves intraday, but we still want fresh end-of-day data.
+    """
+    try:
+        import streamlit as _st  # type: ignore
+
+        @_st.cache_data(ttl=600, show_spinner=False)
+        def _cached() -> Tuple[pd.DataFrame, Dict]:
+            return _fetch_yield_curve_uncached()
+
+        return _cached()
+    except Exception:
+        return _fetch_yield_curve_uncached()
+
+
+# ══════════════════════════════════════════════════════════════
+#  3a-SOURCE-OF-TRUTH:  10Y Treasury yield
+# ──────────────────────────────────────────────────────────────
+#  ONE function the chat, page 7, page 8, and any future caller
+#  share. Background: previously the 10Y appeared in 4 places
+#  driven by 2 different sources (yfinance ^TNX vs FRED DGS10).
+#  FRED publishes the previous trading day's close around
+#  midnight ET — meaning during US trading hours FRED is always
+#  ~1 trading day stale vs yfinance's intraday/EOD ^TNX. Users
+#  comparing our number to a quote site saw the gap and reported
+#  "wrong closing price." Fix: prefer yfinance for freshness,
+#  fall back to FRED, and always return the observation date so
+#  the UI / LLM can label it.
+# ══════════════════════════════════════════════════════════════
+
+# Plausible range for the US 10Y yield. Anything outside this
+# window is almost certainly a unit/parsing bug — guard so we
+# never silently surface a bogus value to the LLM.
+_TEN_Y_MIN_PCT = 0.3
+_TEN_Y_MAX_PCT = 12.0
+
+
+def _fetch_10y_from_yfinance() -> Optional[dict]:
+    """Pull the latest ^TNX close. yfinance returns ^TNX already in
+    percent form (e.g. 4.59 → 4.59%); no scaling required. Verified
+    live 2026-05 — see CLAUDE.md."""
+    try:
+        tnx = yf.Ticker("^TNX")
+        hist = tnx.history(period="5d").dropna(subset=["Close"])
+        if hist.empty:
+            return None
+        last_close = float(hist["Close"].iloc[-1])
+        last_dt = hist.index[-1]
+        if not (_TEN_Y_MIN_PCT <= last_close <= _TEN_Y_MAX_PCT):
+            logger.warning("10y_yfinance_out_of_range value=%s", last_close)
+            return None
+        prev_close = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else None
+        change = (last_close - prev_close) if prev_close is not None else None
+        return {
+            "value": last_close,
+            "date": pd.Timestamp(last_dt).strftime("%Y-%m-%d"),
+            "change": change,
+            "source": "Yahoo Finance (^TNX)",
+        }
+    except Exception as exc:
+        logger.debug("10y_yfinance_failed: %s", exc)
+        return None
+
+
+def _fetch_10y_from_fred() -> Optional[dict]:
+    """Fallback: FRED DGS10. Publishes T-1 close, no intraday."""
+    try:
+        obs = _fred_fetch_series_raw("DGS10")
+        if not obs:
+            return None
+        latest_dt, latest_val = obs[-1]
+        if not (_TEN_Y_MIN_PCT <= latest_val <= _TEN_Y_MAX_PCT):
+            logger.warning("10y_fred_out_of_range value=%s", latest_val)
+            return None
+        prev_val = obs[-2][1] if len(obs) >= 2 else None
+        change = (latest_val - prev_val) if prev_val is not None else None
+        return {
+            "value": float(latest_val),
+            "date": pd.Timestamp(latest_dt).strftime("%Y-%m-%d"),
+            "change": change,
+            "source": "FRED (DGS10)",
+        }
+    except Exception as exc:
+        logger.debug("10y_fred_failed: %s", exc)
+        return None
+
+
+def _fetch_10y_yield_uncached() -> Optional[dict]:
+    """Single source of truth for the 10Y. Prefers yfinance ^TNX (fresher,
+    intraday or EOD same-day), falls back to FRED DGS10 (T-1 daily
+    close) when yfinance is unreachable.
+
+    Returns ``None`` if both sources fail. Otherwise:
+
+        {
+            "value": 4.595,           # percent
+            "date": "2026-05-15",     # ISO date of the observation
+            "change": 0.134,          # day-over-day change in pp, or None
+            "source": "Yahoo Finance (^TNX)" | "FRED (DGS10)",
+        }
+    """
+    return _fetch_10y_from_yfinance() or _fetch_10y_from_fred()
+
+
+def fetch_10y_yield() -> Optional[dict]:
+    """Public accessor with 10-min Streamlit cache."""
+    try:
+        import streamlit as _st  # type: ignore
+
+        @_st.cache_data(ttl=600, show_spinner=False)
+        def _cached() -> Optional[dict]:
+            return _fetch_10y_yield_uncached()
+
+        return _cached()
+    except Exception:
+        return _fetch_10y_yield_uncached()
+
+
+# ══════════════════════════════════════════════════════════════
+#  3b. CNN Fear & Greed Index
+# ══════════════════════════════════════════════════════════════
+
+FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+
+FEAR_GREED_RATINGS = {
+    "extreme fear": {"icon": "🔴", "color": "#C92A2A"},
+    "fear": {"icon": "🟠", "color": "#E67700"},
+    "neutral": {"icon": "🟡", "color": "#F59F00"},
+    "greed": {"icon": "🟢", "color": "#37B24D"},
+    "extreme greed": {"icon": "🟢", "color": "#2B8A3E"},
+}
+
+
+def _fetch_fear_greed_uncached(timeout: int = 10) -> Dict:
+    """Raw CNN Fear & Greed fetcher (no caching)."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; PortfolioRisk/1.0)",
+            "Accept": "application/json",
+        }
+        resp = requests.get(FEAR_GREED_URL, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+
+        fg = data.get("fear_and_greed", {})
+        score = fg.get("score")
+        rating = fg.get("rating", "").lower()
+        rating_meta = FEAR_GREED_RATINGS.get(rating, {"icon": "⚪", "color": "#64748B"})
+
+        result = {
+            "score": round(score, 1) if score is not None else None,
+            "rating": rating,
+            "rating_display": rating.title(),
+            "rating_icon": rating_meta["icon"],
+            "rating_color": rating_meta["color"],
+            "previous_close": fg.get("previous_close"),
+            "one_week_ago": fg.get("previous_1_week"),
+            "one_month_ago": fg.get("previous_1_month"),
+            "one_year_ago": fg.get("previous_1_year"),
+            "timestamp": fg.get("timestamp", ""),
+        }
+
+        # Historical data
+        fgh = data.get("fear_and_greed_historical", {})
+        hist_raw = fgh.get("data", [])
+        if hist_raw:
+            hist_df = pd.DataFrame(hist_raw)
+            if "x" in hist_df.columns and "y" in hist_df.columns:
+                hist_df["date"] = pd.to_datetime(hist_df["x"], unit="ms")
+                hist_df = hist_df.rename(columns={"y": "score"})
+                result["historical"] = hist_df[["date", "score"]].dropna()
+            else:
+                result["historical"] = pd.DataFrame()
+        else:
+            result["historical"] = pd.DataFrame()
+
+        # Sub-indices
+        sub_keys = [
+            ("market_momentum_sp500", "S&P 500 Momentum"),
+            ("stock_price_strength", "Stock Price Strength"),
+            ("stock_price_breadth", "Stock Price Breadth"),
+            ("put_call_options", "Put/Call Options"),
+            ("market_volatility_vix", "Market Volatility (VIX)"),
+            ("junk_bond_demand", "Junk Bond Demand"),
+            ("safe_haven_demand", "Safe Haven Demand"),
+        ]
+        sub_indices = {}
+        for key, label in sub_keys:
+            sub_data = data.get(key, {})
+            if isinstance(sub_data, dict) and "score" in sub_data:
+                sub_indices[label] = {
+                    "score": round(sub_data["score"], 1),
+                    "rating": sub_data.get("rating", "").title(),
+                }
+        result["sub_indices"] = sub_indices
+
+        return result
+    except Exception:
+        return {"score": None, "rating": "N/A", "rating_icon": "⚪", "sub_indices": {}}
+
+
+def fetch_fear_greed(timeout: int = 10) -> Dict:
+    """CNN Fear & Greed Index with 10-minute cache (Streamlit-aware).
+
+    The index updates a few times per day at most; 10-min TTL is plenty
+    fresh while eliminating redundant HTTP hits on every Markets page
+    rerun.
+    """
+    try:
+        import streamlit as _st  # type: ignore
+
+        @_st.cache_data(ttl=600, show_spinner=False)
+        def _cached(timeout: int) -> Dict:
+            return _fetch_fear_greed_uncached(timeout)
+
+        return _cached(timeout)
+    except Exception:
+        return _fetch_fear_greed_uncached(timeout)
+
+
+# ══════════════════════════════════════════════════════════════
+#  3.5  FRED Macroeconomic Releases
+# ──────────────────────────────────────────────────────────────
+#  Public helper used by both pages/8_Institutions.py (UI table)
+#  AND build_ai_risk_briefing / floating_chat (prompt injection).
+#  Single source of truth so the LLM sees the same numbers the
+#  user sees on screen.
+# ══════════════════════════════════════════════════════════════
+
+# FRED series we surface. Order matters: the first ~6 entries are
+# the macro-relevant ones we inject into the LLM prompt (inflation
+# + jobs + Fed funds + 10Y). The rest are page-table only.
+_FRED_SPECS = [
+    # series_id,    label,                              cadence,   unit
+    ("CPIAUCSL", "CPI", "Monthly", "index"),
+    ("CPILFESL", "Core CPI", "Monthly", "index"),
+    ("PCEPI", "PCE Price Index", "Monthly", "index"),
+    ("PCEPILFE", "Core PCE Price Index", "Monthly", "index"),
+    ("UMCSENT", "University of Michigan Sentiment", "Monthly", "index"),
+    ("FEDFUNDS", "Effective Fed Funds Rate", "Monthly", "pct"),
+    ("DFEDTARL", "Fed Target Range Lower", "Daily", "pct"),
+    ("DFEDTARU", "Fed Target Range Upper", "Daily", "pct"),
+    ("DGS10", "10Y Treasury Yield", "Daily", "pct"),
+    ("T10Y2Y", "10Y-2Y Treasury Spread", "Daily", "pct"),
+    ("UNRATE", "Unemployment Rate", "Monthly", "pct"),
+    ("PAYEMS", "Nonfarm Payrolls", "Monthly", "thousands"),
+]
+
+
+# Module-level memo for Lambda / non-streamlit environments. Keyed by
+# series_id → (timestamp, list_of_observations).
+_FRED_MEMO: dict = {}
+_FRED_MEMO_TTL_SECONDS = 1800  # 30 min, matches the st.cache_data TTL
+
+
+def _fred_fetch_series_raw(series_id: str) -> list[tuple]:
+    """Fetch a FRED series via the public CSV endpoint.
+
+    Returns a list of (datetime, float) tuples, oldest first. Always uses
+    a short timeout so it can't block the Streamlit thread; on any error
+    returns []. Memoised at module level with a 30 min TTL so callers
+    outside of Streamlit (tests, Lambda) don't hammer FRED either.
+    """
+    import time as _time
+
+    cached = _FRED_MEMO.get(series_id)
+    if cached and (_time.time() - cached[0] < _FRED_MEMO_TTL_SECONDS):
+        return cached[1]
+
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    # IMPORTANT: bypass _http_session — its Retry(total=3) middleware
+    # retries on read timeouts AS WELL AS on 5xx, so a "timeout=N" call
+    # actually takes up to 3*N before giving up. With N=15 that's 45s,
+    # well past Streamlit's UX budget. Verified live: a vanilla
+    # `requests.get(url, timeout=10)` to the same FRED endpoint returns
+    # in <1s. We use a fresh requests.get here so a transient hiccup
+    # fails fast and we move on to the next series, instead of all 12
+    # series stacking 45s timeouts in serial.
+    try:
+        resp = requests.get(
+            url,
+            timeout=10,
+            headers={"User-Agent": "MindMarket-AI/1.0 (+https://mindmarket.app)"},
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.warning("FRED fetch failed for %s: %s", series_id, exc)
+        return []
+
+    from io import StringIO
+
+    try:
+        df = pd.read_csv(StringIO(resp.text))
+    except Exception as exc:
+        logger.debug("FRED CSV parse failed for %s: %s", series_id, exc)
+        return []
+
+    if "observation_date" not in df.columns or series_id not in df.columns:
+        return []
+
+    df = df.rename(columns={"observation_date": "date", series_id: "value"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["date", "value"]).sort_values("date")
+    obs = [(row.date, float(row.value)) for row in df.itertuples(index=False)]
+    _FRED_MEMO[series_id] = (_time.time(), obs)
+    return obs
+
+
+def _format_macro_row(series_id: str, label: str, cadence: str, unit: str) -> Optional[dict]:
+    """Build one release row. Returns None if data is missing entirely."""
+    obs = _fred_fetch_series_raw(series_id)
+    if not obs:
+        return None
+
+    latest_date, latest_value = obs[-1]
+    prev = obs[-2] if len(obs) >= 2 else None
+    year_ago = obs[-13] if cadence == "Monthly" and len(obs) >= 13 else None
+
+    last_change = (latest_value - prev[1]) if prev is not None else None
+    yoy = ((latest_value / year_ago[1]) - 1.0) * 100 if year_ago is not None else None
+
+    if unit == "pct":
+        latest_text = f"{latest_value:.2f}%"
+        change_text = f"{last_change:+.2f} pp" if last_change is not None else "--"
+    elif unit == "index":
+        latest_text = f"{latest_value:.1f}"
+        change_text = f"{last_change:+.1f}" if last_change is not None else "--"
+    elif unit == "thousands":
+        latest_text = f"{latest_value:,.0f}K"
+        change_text = f"{last_change:+,.0f}K" if last_change is not None else "--"
+    else:
+        latest_text = f"{latest_value:.2f}"
+        change_text = f"{last_change:+.2f}" if last_change is not None else "--"
+
+    # Friendly "Series" label: prefer YoY phrasing for index series so the
+    # LLM can read "CPI YoY: 3.20%" without needing to know it's an index.
+    if unit == "index" and yoy is not None:
+        series_label = f"{label} YoY"
+        ai_value_text = f"{yoy:+.2f}%"
+    else:
+        series_label = label
+        ai_value_text = latest_text
+
+    date_text = pd.Timestamp(latest_date).strftime("%Y-%m-%d")
+
+    return {
+        # --- Spec-mandated keys (consumed by AI prompt + chat) ---
+        "Series": series_label,
+        "Latest": ai_value_text,
+        "Date": date_text,
+        "Source": "FRED",
+        "fred_id": series_id,
+        # --- Legacy keys preserved for the page 8 dataframe layout ---
+        "Indicator": label,
+        "Cadence": cadence,
+        "Latest Date": date_text,
+        "Last Change": change_text,
+        "YoY": f"{yoy:+.2f}%" if yoy is not None else "--",
+        "_raw_value": latest_value,
+        "_raw_date": pd.Timestamp(latest_date),
+    }
+
+
+def _fetch_macro_releases_uncached(max_age_days: int = 60) -> List[dict]:
+    """Internal implementation — see fetch_macro_releases for docs."""
+    rows: List[dict] = []
+    cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=max_age_days)
+    for series_id, label, cadence, unit in _FRED_SPECS:
+        try:
+            row = _format_macro_row(series_id, label, cadence, unit)
+        except Exception as exc:  # never raise into Streamlit
+            logger.debug("Macro row build failed for %s: %s", series_id, exc)
+            row = None
+        if row is None:
+            continue
+        # Drop stale rows (e.g. discontinued series)
+        try:
+            if row["_raw_date"] < cutoff and cadence == "Daily":
+                continue
+        except Exception:
+            pass
+        rows.append(row)
+    return rows
+
+
+def fetch_macro_releases(max_age_days: int = 60) -> List[dict]:
+    """Return the latest FRED economic release rows.
+
+    Each row contains:
+        Series   -- friendly label (e.g. "CPI YoY")
+        Latest   -- formatted current value (e.g. "3.20%")
+        Date     -- ISO date string (e.g. "2026-04-01")
+        Source   -- always "FRED"
+        fred_id  -- FRED series id (e.g. "CPIAUCSL")
+        ...plus legacy keys (Indicator/Cadence/Last Change/YoY) used
+        by the page 8 dataframe layout.
+
+    Returns [] if FRED is unreachable. Cached for 30 minutes via
+    st.cache_data when Streamlit is importable; otherwise memoised in
+    a module-level dict so Lambda / test environments still avoid
+    hitting FRED on every call.
+    """
+    try:
+        import streamlit as _st  # type: ignore
+
+        @_st.cache_data(ttl=1800, show_spinner=False)
+        def _cached(max_age_days: int) -> List[dict]:
+            return _fetch_macro_releases_uncached(max_age_days)
+
+        # cache_data hashes args; pass through.
+        return _cached(max_age_days)
+    except Exception:
+        # Streamlit not importable or cache failure → fall back to
+        # module-level memo (already in _fred_fetch_series_raw).
+        return _fetch_macro_releases_uncached(max_age_days)
+
+
+# ══════════════════════════════════════════════════════════════
+#  4. AI comprehensive risk briefing
+# ══════════════════════════════════════════════════════════════
+
+
+def build_ai_risk_briefing(
+    report,
+    weights: Dict[str, float],
+    vix_info: Dict,
+    yield_analysis: Dict,
+    fundamentals_df: pd.DataFrame,
+    macro_news: List[Dict],
+    sentiment_data: Optional[Dict] = None,
+    macro_releases: Optional[List[Dict]] = None,
+    lang: str = "en",
+) -> str:
+    """
+    Combine data across all dimensions into a structured AI risk-briefing prompt.
+    Returns the text for the LLM to generate the final briefing.
+    """
+    sections = []
+
+    # ── A. Market sentiment overview ────────────────────────────
+    sections.append("## A. Market Sentiment Overview")
+
+    if vix_info.get("current") is not None:
+        vix_val = vix_info["current"]
+        vix_change = vix_info.get("change")
+        change_str = f" ({vix_change:+.1%} vs prev close)" if vix_change else ""
+        label = "VIX fear index"
+        sections.append(f"  {label}: {vix_val:.2f}{change_str} - {vix_info['level']}")
+
+    if yield_analysis:
+        status = yield_analysis.get("curve_status", "N/A")
+        spread = yield_analysis.get("3M-10Y Spread")
+        spread_str = f", 3M-10Y spread: {spread:+.2f}%" if spread is not None else ""
+        label = "Yield curve"
+        sections.append(f"  {label}: {status}{spread_str}")
+
+    sections.append("")
+
+    # ── B. Macro news summary ───────────────────────────────────
+    if macro_news:
+        sections.append("## B. Latest Macro News (Top 10)")
+        for i, item in enumerate(macro_news[:10], 1):
+            sections.append(f"  {i}. [{item['source']}] {item['title']}")
+        sections.append("")
+
+    # ── C. Holdings fundamentals snapshot ───────────────────────
+    if fundamentals_df is not None and not fundamentals_df.empty:
+        sections.append("## C. Holdings Fundamentals Snapshot (Top 10)")
+        top_tickers = sorted(weights, key=lambda x: -weights[x])[:10]
+        for tk in top_tickers:
+            if tk in fundamentals_df.index:
+                row = fundamentals_df.loc[tk]
+                pe = row.get("P/E (TTM)")
+                mcap = row.get("Market Cap")
+                eps = row.get("EPS (TTM)")
+                dy = row.get("Div Yield")
+                rg = row.get("Rev Growth")
+                pct_high = row.get("% from 52W High")
+
+                parts = [f"  {tk} (wt: {weights[tk]:.1%}):"]
+                if pd.notna(pe):
+                    parts.append(f"P/E={pe:.1f}")
+                if pd.notna(mcap):
+                    parts.append(f"MCap={_fmt_market_cap(mcap)}")
+                if pd.notna(eps):
+                    parts.append(f"EPS=${eps:.2f}")
+                if pd.notna(dy) and isinstance(dy, (int, float)):
+                    parts.append(f"Div={dy:.1%}")
+                if pd.notna(rg) and isinstance(rg, (int, float)):
+                    parts.append(f"RevGr={rg:.1%}")
+                if pd.notna(pct_high) and isinstance(pct_high, (int, float)):
+                    parts.append(f"vs52WH={pct_high:.1%}")
+                sections.append("  ".join(parts))
+        sections.append("")
+
+    # ── D. Quantitative risk metrics ────────────────────────────
+    sections.append("## D. Core Quantitative Risk Metrics")
+    sections.append(
+        f"  VaR 95%: {report.var_95:.2%} | VaR 99%: {report.var_99:.2%} | CVaR 95%: {report.cvar_95:.2%}"
+    )
+    sections.append(
+        f"  Annual volatility: {report.annual_volatility:.2%} | Sharpe: {report.sharpe_ratio:.2f} | Max drawdown: {report.max_drawdown:.2%}"
+    )
+    sections.append(f"  Stress loss: {report.stress_loss:.2%}")
+
+    if report.margin_call_info and report.margin_call_info.get("has_margin"):
+        mi = report.margin_call_info
+        sections.append(
+            f"  Leverage: {mi['leverage']:.2f}x | Distance to margin call: {mi['distance_to_call_pct']:.1%}"
+        )
+    sections.append("")
+
+    # ── E. Sentiment scores ─────────────────────────────────────
+    if sentiment_data:
+        sections.append("## E. Single-Name Sentiment Scores")
+        for tk, data in sorted(sentiment_data.items(), key=lambda x: x[1]["score"]):
+            sections.append(f"  {tk}: {data['score']:+d}/10 — {data['summary'][:60]}")
+        sections.append("")
+
+    # ── F. Recent macroeconomic releases (FRED) ─────────────────
+    if macro_releases:
+        # Show only the most macro-relevant series so we don't drown the
+        # prompt. We prefer inflation / jobs / policy rate / curve.
+        _ai_focus = {
+            "CPIAUCSL",
+            "CPILFESL",
+            "PCEPI",
+            "PCEPILFE",
+            "FEDFUNDS",
+            "UNRATE",
+            "PAYEMS",
+            "DGS10",
+            "T10Y2Y",
+        }
+        focused = [r for r in macro_releases if r.get("fred_id") in _ai_focus][:6]
+        if not focused:
+            focused = macro_releases[:6]
+        if focused:
+            sections.append("## F. Recent Macroeconomic Releases (FRED)")
+            for row in focused:
+                series = row.get("Series", "?")
+                latest = row.get("Latest", "--")
+                date = row.get("Date", "--")
+                fred_id = row.get("fred_id", "")
+                fred_tag = f" ({fred_id})" if fred_id else ""
+                sections.append(f"  {series}{fred_tag}: {latest} as of {date}")
+            sections.append("")
+
+    # ── Generation prompt ──────────────────────────────────────
+    instruction = """## Request
+Based on all the information above, generate a concise comprehensive risk briefing (3-5 paragraphs):
+1. **Market Environment** — What VIX, yield curve, and macro news collectively signal
+2. **Holdings Risk Diagnosis** — Which holdings are overvalued/undervalued based on fundamentals? Growth catalysts?
+3. **Quantitative Risk Alerts** — VaR, stress loss, leverage implications
+4. **Actionable Recommendations** — Specific rebalancing/hedging actions given current conditions
+5. **Key Watchlist Items** — Events or indicators to monitor in the coming week
+
+Tone: Institutional morning briefing style, concise and authoritative, cite specific numbers."""
+
+    sections.append(instruction)
+
+    return "\n".join(sections)
+
+
+def build_market_intelligence_context(
+    vix_info: Dict,
+    yield_analysis: Dict,
+    yield_curve_df: pd.DataFrame,
+    fundamentals_df: pd.DataFrame,
+    macro_news: List[Dict],
+    fear_greed_data: Optional[Dict] = None,
+) -> str:
+    """
+    Build the market-intelligence text injected into the AI chat's system context.
+    """
+    lines = []
+
+    # VIX
+    lines.append("")
+    lines.append("## 17. Market Sentiment - VIX Fear Index")
+    if vix_info.get("current") is not None:
+        v = vix_info
+        change_str = f" ({v['change']:+.1%})" if v.get("change") else ""
+        lines.append(f"  VIX: {v['current']:.2f}{change_str} — {v['level']}")
+        if v["current"] and v["current"] > 25:
+            lines.append("  ⚠ Elevated fear — consider hedging or reducing risk exposure")
+    else:
+        lines.append("  VIX data unavailable")
+    lines.append("")
+
+    # CNN Fear & Greed Index
+    if fear_greed_data and fear_greed_data.get("score") is not None:
+        fg = fear_greed_data
+        lines.append("## 18. CNN Fear & Greed Index")
+        lines.append(
+            f"  Score: {fg['score']}/100 - {fg.get('rating_display', 'N/A')} {fg.get('rating_icon', '')}"
+        )
+        if fg.get("previous_close"):
+            lines.append(f"  Previous Close: {fg['previous_close']:.1f}")
+        if fg.get("one_week_ago"):
+            lines.append(f"  1 Week Ago: {fg['one_week_ago']:.1f}")
+        if fg.get("one_month_ago"):
+            lines.append(f"  1 Month Ago: {fg['one_month_ago']:.1f}")
+        for name, sub in fg.get("sub_indices", {}).items():
+            lines.append(f"  {name}: {sub['score']:.1f} ({sub['rating']})")
+        if fg["score"] <= 25:
+            lines.append("  WARNING: Extreme Fear - historically a contrarian BUY signal")
+        elif fg["score"] >= 75:
+            lines.append("  WARNING: Extreme Greed - historically a contrarian SELL signal")
+        lines.append("")
+
+    # Yield Curve
+    lines.append("## 19. US Treasury Yield Curve")
+    if yield_analysis:
+        status = yield_analysis.get("curve_status", "N/A")
+        icon = yield_analysis.get("curve_icon", "")
+        lines.append(f"  Status: {icon} {status}")
+        if "3M-10Y Spread" in yield_analysis:
+            lines.append(f"  3M-10Y Spread: {yield_analysis['3M-10Y Spread']:+.2f}%")
+        if "10Y-30Y Spread" in yield_analysis:
+            lines.append(f"  10Y-30Y Spread: {yield_analysis['10Y-30Y Spread']:+.2f}%")
+        if yield_analysis.get("inverted_3m_10y"):
+            lines.append("  ⚠ Inverted yield curve — historically a recession signal")
+    if yield_curve_df is not None and not yield_curve_df.empty:
+        lines.append("  Current rates:")
+        for _, row in yield_curve_df.iterrows():
+            curr = row.get("Current (%)")
+            if pd.notna(curr):
+                lines.append(f"    {row['Maturity']}: {curr:.2f}%")
+    lines.append("")
+
+    # Fundamentals summary
+    if fundamentals_df is not None and not fundamentals_df.empty:
+        lines.append("## 20. Holdings Fundamentals Snapshot")
+        for tk in fundamentals_df.index[:15]:
+            row = fundamentals_df.loc[tk]
+            pe = row.get("P/E (TTM)")
+            mcap = row.get("Market Cap")
+            pct_high = row.get("% from 52W High")
+            parts = [f"  {tk}:"]
+            if pd.notna(pe):
+                parts.append(f"P/E={pe:.1f}")
+            if pd.notna(mcap):
+                parts.append(f"MCap={_fmt_market_cap(mcap)}")
+            if pd.notna(pct_high) and isinstance(pct_high, (int, float)):
+                parts.append(f"vs52WH={pct_high:.1%}")
+            lines.append(" ".join(parts))
+        # Flag overvalued
+        if "P/E (TTM)" in fundamentals_df.columns:
+            high_pe = fundamentals_df[fundamentals_df["P/E (TTM)"] > 40].index.tolist()
+            if high_pe:
+                lines.append(f"  ⚠ High P/E (>40): {', '.join(high_pe)}")
+        lines.append("")
+
+    # Macro news headlines
+    if macro_news:
+        lines.append("## 21. Latest Macro News Headlines")
+        for item in macro_news[:8]:
+            lines.append(f"  • [{item['source']}] {item['title'][:100]}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════
+#  5. Simple DCF valuation (Gordon Growth Model)
+# ══════════════════════════════════════════════════════════════
+
+
+def compute_simple_dcf(ticker: str, discount_rate: float = 0.10) -> Dict:
+    """Backwards-compatible alias for compute_advanced_dcf."""
+    return compute_advanced_dcf(ticker)
+
+
+def compute_advanced_dcf(
+    ticker: str,
+    risk_free_rate: float = 0.045,
+    market_return: float = 0.10,
+) -> Dict:
+    """
+    Hybrid valuation model:
+      1) Primary: Two-Stage FCF DCF (if freeCashflow available)
+      2) Fallback: P/E Multiple model (if EPS available but no FCF)
+      3) Skip: ETFs, crypto, and tickers with no fundamental data
+
+    Returns dict: {intrinsic_value, current_price, upside_pct, verdict,
+                   method, discount_rate, ...}
+    """
+    _NA = {
+        "intrinsic_value": None,
+        "current_price": None,
+        "upside_pct": None,
+        "verdict": "N/A",
+        "method": "N/A",
+    }
+
+    # Skip crypto and known non-equity tickers
+    if ticker.endswith("-USD"):
+        return {**_NA, "verdict": "Crypto", "method": "Skipped (Crypto)"}
+
+    try:
+        info = yf.Ticker(ticker).info or {}
+        qtype = info.get("quoteType", "")
+
+        # Skip ETFs
+        if qtype in ("ETF", "MUTUALFUND") or ticker in ("SPY", "QQQ", "GLD", "TQQQ", "COPX", "SLV"):
+            price = (
+                info.get("currentPrice") or info.get("regularMarketPrice") or info.get("navPrice")
+            )
+            return {
+                **_NA,
+                "current_price": round(price, 2) if price else None,
+                "verdict": "ETF",
+                "method": "Skipped (ETF)",
+            }
+
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if not current_price or current_price <= 0:
+            return _NA
+
+        shares = info.get("sharesOutstanding")
+        beta = info.get("beta")
+        if beta is None or not isinstance(beta, (int, float)) or np.isnan(beta):
+            logger.warning(
+                "dcf.beta_fallback", ticker=ticker, reason="beta unavailable, defaulting to 1.0"
+            )
+            beta = 1.0
+
+        # CAPM discount rate
+        cost_of_equity = risk_free_rate + beta * (market_return - risk_free_rate)
+        discount_rate = max(0.06, min(cost_of_equity, 0.15))
+
+        # Growth rates
+        raw_growth = info.get("earningsGrowth") or info.get("revenueGrowth")
+        if raw_growth is None or not isinstance(raw_growth, (int, float)):
+            raw_growth = 0.05
+        short_growth = max(0.02, min(raw_growth, 0.25))
+
+        terminal_growth = 0.025
+        if discount_rate <= terminal_growth:
+            discount_rate = terminal_growth + 0.03
+
+        # ═══════════════════════════════════════════════════════
+        #  Method 1: Two-Stage FCF DCF (preferred)
+        # ═══════════════════════════════════════════════════════
+        fcf = info.get("freeCashflow")
+        total_cash = info.get("totalCash") or 0
+        total_debt = info.get("totalDebt") or 0
+
+        if fcf and shares and fcf > 0 and shares > 0:
+            pv_fcf_total = 0.0
+            projected_fcf = float(fcf)
+            for year in range(1, 6):
+                projected_fcf *= 1 + short_growth
+                pv_fcf_total += projected_fcf / ((1 + discount_rate) ** year)
+
+            terminal_value = (
+                projected_fcf * (1 + terminal_growth) / (discount_rate - terminal_growth)
+            )
+            pv_terminal = terminal_value / ((1 + discount_rate) ** 5)
+
+            enterprise_value = pv_fcf_total + pv_terminal
+            equity_value = enterprise_value + total_cash - total_debt
+
+            if equity_value > 0:
+                intrinsic = equity_value / shares
+                upside_pct = (intrinsic - current_price) / current_price
+                verdict = (
+                    "Undervalued"
+                    if upside_pct > 0.15
+                    else ("Overvalued" if upside_pct < -0.15 else "Fair")
+                )
+                return {
+                    "intrinsic_value": round(intrinsic, 2),
+                    "current_price": round(current_price, 2),
+                    "upside_pct": round(upside_pct, 4),
+                    "verdict": verdict,
+                    "method": "2-Stage FCF DCF",
+                    "discount_rate": round(discount_rate, 4),
+                    "short_term_growth": round(short_growth, 4),
+                    "fcf": fcf,
+                    "ev": round(enterprise_value, 0),
+                    "equity_value": round(equity_value, 0),
+                }
+
+        # ═══════════════════════════════════════════════════════
+        #  Method 2: P/E Multiple Fallback (when no FCF)
+        # ═══════════════════════════════════════════════════════
+        eps = info.get("forwardEps") or info.get("trailingEps")
+        if eps and isinstance(eps, (int, float)) and eps > 0:
+            # Use sector-average P/E or a conservative multiple
+            forward_pe = info.get("forwardPE")
+            trailing_pe = info.get("trailingPE")
+            sector_pe = info.get("sectorPE")  # may not exist
+
+            # Target P/E: use 1/discount_rate as theoretical fair P/E, clamped
+            fair_pe = 1.0 / discount_rate
+            fair_pe = max(8, min(fair_pe, 30))  # clamp 8x-30x
+
+            intrinsic = eps * fair_pe
+            if intrinsic > 0:
+                upside_pct = (intrinsic - current_price) / current_price
+                verdict = (
+                    "Undervalued"
+                    if upside_pct > 0.15
+                    else ("Overvalued" if upside_pct < -0.15 else "Fair")
+                )
+                return {
+                    "intrinsic_value": round(intrinsic, 2),
+                    "current_price": round(current_price, 2),
+                    "upside_pct": round(upside_pct, 4),
+                    "verdict": verdict,
+                    "method": f"P/E Multiple ({fair_pe:.0f}x)",
+                    "discount_rate": round(discount_rate, 4),
+                    "short_term_growth": round(short_growth, 4),
+                }
+
+        # ═══════════════════════════════════════════════════════
+        #  No usable data
+        # ═══════════════════════════════════════════════════════
+        return {
+            **_NA,
+            "current_price": round(current_price, 2),
+            "method": "No FCF or EPS data",
+        }
+
+    except Exception:
+        return _NA
+
+
+# ══════════════════════════════════════════════════════════════
+#  Insider Transaction Signals
+# ══════════════════════════════════════════════════════════════
+
+
+def _fetch_single_insider(tk: str) -> Optional[tuple]:
+    """Fetch insider signals for a single ticker. Returns (ticker, result_dict) or None."""
+    if tk.endswith("-USD"):
+        return None
+
+    cutoff = datetime.now() - timedelta(days=90)
+
+    try:
+        txn_df = yf.Ticker(tk).insider_transactions
+
+        if txn_df is None or txn_df.empty:
+            return (
+                tk,
+                {
+                    "net_shares": 0,
+                    "direction": "No Data",
+                    "count": 0,
+                    "recent_txns": [],
+                },
+            )
+
+        # Determine the date column name
+        date_col = "Start Date" if "Start Date" in txn_df.columns else "Date"
+
+        if date_col in txn_df.columns:
+            txn_df[date_col] = pd.to_datetime(txn_df[date_col], errors="coerce")
+            txn_df = txn_df.dropna(subset=[date_col])
+            txn_df = txn_df[txn_df[date_col] >= cutoff]
+
+        if txn_df.empty:
+            return (
+                tk,
+                {
+                    "net_shares": 0,
+                    "direction": "No Activity",
+                    "count": 0,
+                    "recent_txns": [],
+                },
+            )
+
+        net = int(txn_df["Shares"].sum()) if "Shares" in txn_df.columns else 0
+
+        if net > 0:
+            direction = "Net Buyer"
+        elif net < 0:
+            direction = "Net Seller"
+        else:
+            direction = "No Activity"
+
+        count = len(txn_df)
+
+        # Collect top 3 recent transactions
+        recent_txns: List[str] = []
+        top_rows = txn_df.head(3)
+        for _, row in top_rows.iterrows():
+            shares = row.get("Shares", 0)
+            if shares >= 0:
+                recent_txns.append(f"BUY {abs(int(shares))} shares")
+            else:
+                recent_txns.append(f"SELL {abs(int(shares))} shares")
+
+        return (
+            tk,
+            {
+                "net_shares": net,
+                "direction": direction,
+                "count": count,
+                "recent_txns": recent_txns,
+            },
+        )
+
+    except Exception:
+        return (
+            tk,
+            {
+                "net_shares": 0,
+                "direction": "No Data",
+                "count": 0,
+                "recent_txns": [],
+            },
+        )
+
+
+def fetch_insider_signals(tickers: List[str]) -> Dict[str, dict]:
+    """
+    Fetch insider transactions for each ticker, compute net buy/sell direction.
+    Returns {ticker: {net_shares: int, direction: str, count: int, recent_txns: list}}.
+    Uses ThreadPoolExecutor to fetch all tickers in parallel.
+    """
+    results: Dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_single_insider, tk): tk for tk in tickers}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    tk, data = result
+                    results[tk] = data
+            except Exception:
+                continue
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+#  Technical Signals (RSI & SMA50)
+# ══════════════════════════════════════════════════════════════
+
+
+def compute_technical_signals(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate RSI(14) and SMA50 position for each asset from price data.
+    Returns DataFrame indexed by ticker with columns: RSI, RSI_Signal, SMA50, Price, Price_vs_SMA50, Pct_vs_SMA50.
+    """
+    records: List[dict] = []
+
+    for col in prices.columns:
+        series = prices[col].dropna()
+
+        # --- RSI(14) ---
+        delta = prices[col].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(14).mean()
+        avg_loss = loss.rolling(14).mean()
+        rs = avg_gain / avg_loss
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi_val = rsi_series.dropna().iloc[-1] if not rsi_series.dropna().empty else None
+
+        if rsi_val is not None and not np.isnan(rsi_val):
+            rsi_val = round(rsi_val, 2)
+            if rsi_val > 70:
+                rsi_signal = "Overbought"
+            elif rsi_val < 30:
+                rsi_signal = "Oversold"
+            else:
+                rsi_signal = "Neutral"
+        else:
+            rsi_val = "N/A"
+            rsi_signal = "N/A"
+
+        # --- SMA50 ---
+        sma50_series = prices[col].rolling(50).mean()
+        sma50_val = sma50_series.dropna().iloc[-1] if not sma50_series.dropna().empty else None
+
+        price_val = prices[col].iloc[-1] if len(prices[col]) > 0 else None
+
+        if (
+            sma50_val is not None
+            and price_val is not None
+            and not np.isnan(sma50_val)
+            and not np.isnan(price_val)
+        ):
+            sma50_val = round(sma50_val, 2)
+            price_val_round = round(price_val, 2)
+            price_vs_sma = "Above" if price_val > sma50_val else "Below"
+            pct_vs_sma = (
+                round((price_val - sma50_val) / sma50_val * 100, 2) if sma50_val != 0 else 0.0
+            )
+        else:
+            sma50_val = "N/A"
+            price_val_round = (
+                round(price_val, 2) if price_val is not None and not np.isnan(price_val) else "N/A"
+            )
+            price_vs_sma = "N/A"
+            pct_vs_sma = "N/A"
+
+        records.append(
+            {
+                "Ticker": col,
+                "RSI": rsi_val,
+                "RSI_Signal": rsi_signal,
+                "SMA50": sma50_val,
+                "Price": price_val_round,
+                "Price_vs_SMA50": price_vs_sma,
+                "Pct_vs_SMA50": pct_vs_sma,
+            }
+        )
+
+    return pd.DataFrame(records).set_index("Ticker")
+
+
+# ══════════════════════════════════════════════════════════════
+#  8. Reddit retail sentiment (Apify)
+# ══════════════════════════════════════════════════════════════
+
+
+def fetch_reddit_sentiment_apify(
+    tickers: List[str],
+    max_posts: int = 15,
+    apify_key: Optional[str] = None,
+) -> Dict[str, List[Dict]]:
+    """
+    Fetch Reddit posts via Apify. Two strategies:
+    1. Hot posts from r/wallstreetbets and r/stocks (general market buzz)
+    2. Filter/tag posts that mention specific tickers
+
+    Returns {"_hot": [general hot posts], "NVDA": [ticker-specific], ...}
+    """
+    if not apify_key:
+        return {"_hot": [], **{tk: [] for tk in tickers}}
+
+    all_posts = []
+
+    # Detect crypto tickers (ending in -USD) — only pay the crypto-subreddit
+    # latency cost if the portfolio actually holds crypto.
+    has_crypto = any(isinstance(tk, str) and tk.upper().endswith("-USD") for tk in (tickers or []))
+
+    # Strategy A: Use Apify's web scraper to fetch Reddit JSON API directly
+    # Reddit exposes .json endpoints that don't need authentication
+    subreddits = ["wallstreetbets", "stocks"]
+    if has_crypto:
+        subreddits += ["cryptocurrency", "CryptoMarkets"]
+    for sub in subreddits:
+        try:
+            # Reddit's public JSON API (no auth needed, just add .json)
+            url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25&t=day"
+            headers = {"User-Agent": "MindMarketAI/1.0 (Portfolio Risk Dashboard)"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for child in data.get("data", {}).get("children", []):
+                    post = child.get("data", {})
+                    title = post.get("title", "")
+                    text = post.get("selftext", "")
+                    score = post.get("score", 0)
+                    num_comments = post.get("num_comments", 0)
+                    created = post.get("created_utc", 0)
+                    permalink = post.get("permalink", "")
+                    if title and score > 5:  # filter low-quality
+                        all_posts.append(
+                            {
+                                "title": title[:200],
+                                "text": (text or "")[:500],
+                                "upvotes": int(score),
+                                "comments": int(num_comments),
+                                "subreddit": sub,
+                                "url": f"https://reddit.com{permalink}" if permalink else "",
+                            }
+                        )
+        except Exception:
+            continue
+
+    # Strategy B: If Reddit JSON API fails (rate limited), try Apify actor as backup
+    if not all_posts:
+        try:
+            from apify_client import ApifyClient
+
+            client = ApifyClient(apify_key)
+
+            run_input = {
+                "startUrls": [
+                    {"url": "https://www.reddit.com/r/wallstreetbets/hot/"},
+                    {"url": "https://www.reddit.com/r/stocks/hot/"},
+                ],
+                "maxItems": 30,
+                "sort": "hot",
+                "time": "day",
+            }
+
+            # Try multiple actor IDs (Apify ecosystem varies)
+            for actor_id in [
+                "trudax/reddit-scraper",
+                "apify/reddit-scraper",
+                "okheydk/reddit-scraper",
+            ]:
+                try:
+                    run = client.actor(actor_id).call(
+                        run_input=run_input,
+                        timeout_secs=45,
+                        memory_mbytes=256,
+                    )
+                    for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+                        title = item.get("title", "")
+                        text = item.get("body", item.get("text", item.get("selftext", "")))
+                        score = item.get("score", item.get("upVotes", item.get("ups", 0)))
+                        comments = item.get("numberOfComments", item.get("num_comments", 0))
+                        if title:
+                            all_posts.append(
+                                {
+                                    "title": title[:200],
+                                    "text": (text or "")[:500],
+                                    "upvotes": int(score) if score else 0,
+                                    "comments": int(comments) if comments else 0,
+                                    "subreddit": "wsb/stocks",
+                                    "url": item.get("url", ""),
+                                }
+                            )
+                    if all_posts:
+                        break  # found working actor
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+
+    # Sort all posts by upvotes
+    all_posts.sort(key=lambda x: -x["upvotes"])
+
+    # Tag posts by ticker mention — use word-boundary regex so "S" doesn't
+    # match every post containing the letter S, and "AA" doesn't match "AAPL".
+    results = {"_hot": all_posts[:max_posts]}
+
+    # Common crypto aliases — when a BTC-USD ticker is in the portfolio we
+    # should also match posts mentioning "Bitcoin", etc.
+    crypto_aliases = {
+        "BTC": ["Bitcoin"],
+        "ETH": ["Ethereum"],
+        "SOL": ["Solana"],
+        "XRP": ["Ripple"],
+        "ADA": ["Cardano"],
+        "LINK": ["Chainlink"],
+        "DOGE": ["Dogecoin"],
+    }
+
+    for tk in tickers:
+        tk_clean = tk.upper().replace("-USD", "")
+        # Build alternation list: ticker symbol + any known aliases
+        alts = [re.escape(tk_clean)]
+        for alias in crypto_aliases.get(tk_clean, []):
+            alts.append(re.escape(alias))
+        alt_group = "|".join(alts)
+        # \b handles word boundaries; $ prefix optional.
+        # (?i) makes aliases like "Bitcoin" match regardless of case in the
+        # uppercased search_text below (still safe because search_text is .upper()).
+        pattern = re.compile(rf"(?<![A-Z])\$?(?:{alt_group})(?![A-Z])", re.IGNORECASE)
+        matched = []
+        for p in all_posts:
+            search_text = (p["title"] + " " + p["text"]).upper()
+            if pattern.search(search_text):
+                matched.append(p)
+        results[tk] = matched[:max_posts]
+
+    return results
+
+
+def format_reddit_for_llm(posts: List[Dict], ticker: str = "") -> str:
+    """Format Reddit posts into text for LLM analysis."""
+    if not posts:
+        return ""
+    lines = []
+    for p in posts[:12]:
+        sub = p.get("subreddit", "")
+        upvotes = p.get("upvotes", 0)
+        comments = p.get("comments", 0)
+        lines.append(f"- [{sub}] {p['title']} [+{upvotes}, {comments} comments]")
+        if p.get("text"):
+            lines.append(f"  {p['text'][:200]}")
+    return "\n".join(lines)
+
+
+def fetch_stock_news_fmp(
+    tickers: Tuple[str, ...],
+    fmp_key: str,
+    max_per_ticker: int = 8,
+) -> Dict[str, List[str]]:
+    """
+    Fetch recent news headlines per ticker from Financial Modeling Prep.
+
+    This is a SUPPLEMENT to yfinance news (fetch_asset_news), not a replacement.
+    FMP typically has better coverage/freshness for US equities but charges per
+    call; yfinance remains the default free source. Callers can merge/dedupe
+    the two outputs as needed — the return shape here matches fetch_asset_news
+    ({ticker: [title, title, ...]}) so it's drop-in compatible.
+
+    Skips tickers with a -USD suffix (crypto — FMP stock_news endpoint is for
+    equities only) and returns empty lists for any ticker whose API call fails,
+    so a partial outage never blocks the caller.
+    """
+    results: Dict[str, List[str]] = {}
+    if not tickers:
+        return results
+    if not fmp_key:
+        # Silent fallback — return empty lists for every requested ticker so
+        # callers can still iterate the dict without KeyErrors.
+        return {tk: [] for tk in tickers}
+
+    for tk in tickers:
+        if not isinstance(tk, str) or not tk:
+            continue
+        if tk.upper().endswith("-USD"):
+            # Crypto — FMP stock_news doesn't cover these; skip silently.
+            results[tk] = []
+            continue
+        try:
+            resp = _http_session.get(
+                f"{FMP_BASE}/news/stock",
+                params={
+                    "symbols": tk.upper(),
+                    "limit": int(max_per_ticker),
+                    "apikey": fmp_key,
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                # 402 = premium-required on free tier. Fail silently so the
+                # rest of the Markets page (AI sentiment scoring from other
+                # sources) still renders.
+                results[tk] = []
+                continue
+            data = resp.json()
+            if not isinstance(data, list):
+                results[tk] = []
+                continue
+            titles = [
+                str(item.get("title", "")).strip()
+                for item in data
+                if isinstance(item, dict) and item.get("title")
+            ]
+            results[tk] = titles[:max_per_ticker]
+        except Exception:
+            # Silent on failures — news is best-effort, never block the caller.
+            results[tk] = []
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+#  9. FMP earnings-call transcripts + Claude deep analysis
+# ══════════════════════════════════════════════════════════════
+
+FMP_BASE = "https://financialmodelingprep.com/stable"
+# NOTE: FMP retired /api/v3/ and /api/v4/ on 2025-08-31 for non-legacy accounts.
+# All new paths are query-parameter based: /stable/{endpoint}?symbol=...
+# Some endpoints (earnings transcripts, news) require FMP Starter plan or above.
+
+
+def fetch_latest_transcript_fmp(ticker: str, fmp_key: str) -> Dict:
+    """
+    Fetch the latest earnings call transcript from Financial Modeling Prep.
+    Returns: {date, quarter, year, content, ticker} or {error: str}.
+    """
+    if not fmp_key:
+        return {"error": "FMP_API_KEY not configured"}
+
+    # New stable endpoint. Requires `year` and `quarter` — FMP removed the
+    # "give me the latest" shortcut. We fetch the latest two quarters by
+    # inferring from today's date; the loop tries (year, q) combinations
+    # working backwards until one returns data.
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    now = _dt.now(_tz.utc)
+    # Rough current fiscal quarter (calendar-based); transcripts typically
+    # publish ~1 month after quarter end, so we look back one quarter.
+    q_now = (now.month - 1) // 3 + 1
+    y_now = now.year
+    # Generate 6 (year, quarter) pairs working backwards from "current - 1"
+    candidates: List = []
+    y, q = y_now, q_now
+    for _ in range(6):
+        q -= 1
+        if q == 0:
+            q, y = 4, y - 1
+        candidates.append((y, q))
+
+    url = f"{FMP_BASE}/earning-call-transcript"
+    results: List[Dict] = []
+    try:
+        for yr, qt in candidates:
+            resp = _http_session.get(
+                url,
+                params={"symbol": ticker.upper(), "year": yr, "quarter": qt, "apikey": fmp_key},
+                timeout=15,
+            )
+            if resp.status_code == 402:
+                return {
+                    "error": (
+                        "FMP earnings transcripts require a Starter plan or above. "
+                        "Upgrade at https://site.financialmodelingprep.com/developer/docs/pricing"
+                    )
+                }
+            if resp.status_code == 401:
+                return {"error": "FMP API key is invalid"}
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if isinstance(data, list) and data:
+                latest = data[0]
+                if latest.get("content"):
+                    results.append(
+                        {
+                            "year": yr,
+                            "quarter": qt,
+                            "date": latest.get("date", ""),
+                            "content": latest.get("content", ""),
+                        }
+                    )
+                    if len(results) >= 2:
+                        break
+
+        if not results:
+            return {"error": f"No transcript available for {ticker} in the last 6 quarters"}
+
+        result = {
+            "ticker": ticker.upper(),
+            "date": results[0]["date"],
+            "quarter": results[0]["quarter"],
+            "year": results[0]["year"],
+            "content": results[0]["content"],
+        }
+        if len(results) >= 2:
+            prev = results[1]
+            result["prev_quarter"] = prev["quarter"]
+            result["prev_year"] = prev["year"]
+            result["prev_content"] = prev["content"]
+            result["prev_date"] = prev["date"]
+        return result
+    except Exception as e:
+        return {"error": f"Failed to fetch transcript: {e}"}
+
+
+def analyze_transcript_with_claude(
+    ticker: str,
+    transcript_data: Dict,
+    anthropic_api_key: str,
+) -> Dict:
+    """
+    Send earnings call transcript(s) to Claude for deep NLP analysis.
+    If two quarters are available, performs QoQ sentiment delta analysis.
+    Returns structured JSON with management tone, guidance, capex, Q&A highlights,
+    and sentiment_deltas (if 2 quarters provided).
+    """
+    import json as _json
+
+    content = transcript_data.get("content", "")
+    if not content:
+        return {"error": "No transcript content to analyze"}
+
+    quarter = transcript_data.get("quarter", "?")
+    year = transcript_data.get("year", "?")
+    date = transcript_data.get("date", "?")
+    prev_content = transcript_data.get("prev_content", "")
+    prev_q = transcript_data.get("prev_quarter", "")
+    prev_y = transcript_data.get("prev_year", "")
+    has_prev = bool(prev_content)
+
+    # Build transcript text — truncate each to fit within token limits
+    if has_prev:
+        current_trunc = content[:18000]
+        prev_trunc = prev_content[:12000]
+        transcript_block = (
+            f"=== CURRENT QUARTER: Q{quarter} {year} ({date}) ===\n{current_trunc}\n\n"
+            f"=== PREVIOUS QUARTER: Q{prev_q} {prev_y} ===\n{prev_trunc}"
+        )
+    else:
+        transcript_block = content[:30000]
+
+    # Build prompt
+    delta_field = ""
+    if has_prev:
+        delta_field = (
+            f'  "sentiment_deltas": [\n'
+            f'    {{"topic": "<Revenue Guidance|CAPEX|Macro Outlook|Competition|Margins>", '
+            f'"direction": "<up|down|flat>", '
+            f'"detail": "<1-sentence describing how management tone changed from Q{prev_q} to Q{quarter}>"}}\n'
+            f"  ],\n"
+        )
+
+    prompt = (
+        f"You are a senior buy-side equity analyst at a top-tier hedge fund.\n"
+        f"Analyze {'these two quarters of' if has_prev else 'this'} earnings call transcript(s) for {ticker}.\n"
+        f"{'Compare Q' + str(prev_q) + ' ' + str(prev_y) + ' vs Q' + str(quarter) + ' ' + str(year) + ' to identify marginal changes in management sentiment.' if has_prev else ''}\n\n"
+        f"Return ONLY valid JSON:\n"
+        f"{{\n"
+        f'  "management_tone": "<Hawkish|Dovish|Neutral> with 1-sentence justification",\n'
+        f'  "forward_guidance": "<1-2 sentence summary of outlook>",\n'
+        f'  "capex_and_margins": "<key statements about CAPEX or margins>",\n'
+        f'  "qa_highlights": [\n'
+        f'    {{"question": "<analyst question>", "response": "<management response>"}},\n'
+        f'    {{"question": "<analyst question>", "response": "<management response>"}}\n'
+        f"  ],\n"
+        f'  "key_risks": "<1-2 risks flagged>",\n'
+        f'  "sentiment_shift": "<tone change within the call or across quarters>",\n'
+        f"{delta_field}"
+        f"}}\n\n"
+        f"TRANSCRIPT(S):\n{transcript_block}"
+    )
+
+    try:
+        import time
+
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=anthropic_api_key)
+
+        for attempt in range(3):
+            try:
+                resp = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=1500,
+                    system="You are a senior Wall Street buy-side equity analyst. Analyze earnings call transcripts with precision. Return only valid JSON.",
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = resp.content[0].text.strip()
+                break
+            except Exception as e:
+                if "overloaded" in str(e).lower() or "529" in str(e):
+                    if attempt < 2:
+                        time.sleep(3 * (attempt + 1))
+                        continue
+                raise
+
+        # Parse JSON
+        import re as _re
+
+        cleaned = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+
+        parsed = None
+        try:
+            parsed = _json.loads(cleaned)
+        except (_json.JSONDecodeError, ValueError):
+            brace_start = cleaned.find("{")
+            brace_end = cleaned.rfind("}")
+            if brace_start != -1 and brace_end > brace_start:
+                try:
+                    parsed = _json.loads(cleaned[brace_start : brace_end + 1])
+                except (_json.JSONDecodeError, ValueError):
+                    pass
+
+        if parsed and isinstance(parsed, dict):
+            result = {
+                "management_tone": parsed.get("management_tone", "N/A"),
+                "forward_guidance": parsed.get("forward_guidance", "N/A"),
+                "capex_and_margins": parsed.get("capex_and_margins", "N/A"),
+                "qa_highlights": parsed.get("qa_highlights", []),
+                "key_risks": parsed.get("key_risks", "N/A"),
+                "sentiment_shift": parsed.get("sentiment_shift", "N/A"),
+                "raw": cleaned,
+            }
+            # QoQ sentiment deltas (if 2 quarters analyzed)
+            deltas = parsed.get("sentiment_deltas", [])
+            if deltas and isinstance(deltas, list):
+                result["sentiment_deltas"] = deltas
+                result["has_qoq"] = True
+            else:
+                result["sentiment_deltas"] = []
+                result["has_qoq"] = False
+            return result
+
+        return {"error": "Failed to parse Claude response", "raw": cleaned}
+
+    except ImportError:
+        return {"error": "anthropic package not installed"}
+    except Exception as e:
+        return {"error": f"Claude analysis failed: {e}"}
+
+
+def fetch_price_targets_fmp(ticker: str, fmp_key: str) -> Dict:
+    """
+    Fetch analyst price target consensus from FMP /stable/ API.
+    Returns: {low, median, consensus, high} or {} on any error.
+    """
+    if not fmp_key:
+        return {}
+    try:
+        resp = _http_session.get(
+            f"{FMP_BASE}/price-target-consensus",
+            params={"symbol": ticker.upper(), "apikey": fmp_key},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            d = data[0]
+            return {
+                "low": d.get("targetLow"),
+                "median": d.get("targetMedian"),
+                "consensus": d.get("targetConsensus"),
+                "high": d.get("targetHigh"),
+            }
+        return {}
+    except Exception:
+        return {}
+
+
+# ══════════════════════════════════════════════════════════════
+#  Comprehensive Ticker Research
+# ══════════════════════════════════════════════════════════════
+
+
+def fetch_ticker_research(ticker: str, fmp_key: str = "") -> Dict:
+    """
+    Comprehensive single-ticker research aggregator.
+    Fetches fundamentals, valuation, technicals, insider activity,
+    analyst ratings, institutional holders, and builds a summary context
+    string suitable for LLM-based recommendation generation.
+
+    Each data source is wrapped in try/except so partial failures
+    do not break the overall result.
+
+    Returns a single dict with all research data organized by category.
+    """
+    tk = yf.Ticker(ticker)
+    result: Dict = {
+        "ticker": ticker.upper(),
+        "company_name": None,
+        "sector": None,
+        "industry": None,
+        "description": None,
+        "website": None,
+        "employees": None,
+        "market_cap": None,
+        "current_price": None,
+        "fundamentals": {},
+        "valuation": {},
+        "analyst_rating": None,
+        "analyst_count": None,
+        "price_targets": {},
+        "recent_upgrades": [],
+        "technicals": {},
+        "insider": {},
+        "top_institutions": [],
+        "institutional_pct": None,
+        "summary_context": "",
+    }
+
+    # ── 1. yfinance .info (company profile + all useful fields) ──
+    info: Dict = {}
+    try:
+        info = tk.info or {}
+        result["company_name"] = info.get("shortName") or info.get("longName")
+        result["sector"] = info.get("sector")
+        result["industry"] = info.get("industry")
+        result["description"] = info.get("longBusinessSummary")
+        result["website"] = info.get("website")
+        result["employees"] = info.get("fullTimeEmployees")
+        result["market_cap"] = info.get("marketCap")
+        result["current_price"] = info.get("currentPrice") or info.get("regularMarketPrice")
+        result["institutional_pct"] = info.get("heldPercentInstitutions")
+    except Exception as e:
+        logger.warning(f"ticker_research.info_failed ticker={ticker} error={e}")
+
+    # ── 2. Fundamentals via _fetch_single_fundamental ──
+    try:
+        fund_result = _fetch_single_fundamental(ticker)
+        if fund_result is not None:
+            _, fund_row = fund_result
+            result["fundamentals"] = fund_row
+    except Exception as e:
+        logger.warning(f"ticker_research.fundamentals_failed ticker={ticker} error={e}")
+
+    # ── 3. Valuation via compute_advanced_dcf ──
+    try:
+        result["valuation"] = compute_advanced_dcf(ticker)
+    except Exception as e:
+        logger.warning(f"ticker_research.dcf_failed ticker={ticker} error={e}")
+
+    # ── 4. Insider activity via _fetch_single_insider ──
+    try:
+        insider_result = _fetch_single_insider(ticker)
+        if insider_result is not None:
+            _, insider_data = insider_result
+            result["insider"] = insider_data
+    except Exception as e:
+        logger.warning(f"ticker_research.insider_failed ticker={ticker} error={e}")
+
+    # ── 5. Analyst recommendations (latest consensus) ──
+    try:
+        recs = tk.recommendations
+        if recs is not None and not recs.empty:
+            # yfinance recommendations DataFrame has columns like
+            # period, strongBuy, buy, hold, sell, strongSell
+            latest = recs.iloc[-1]
+            strong_buy = int(latest.get("strongBuy", 0) or 0)
+            buy = int(latest.get("buy", 0) or 0)
+            hold = int(latest.get("hold", 0) or 0)
+            sell = int(latest.get("sell", 0) or 0)
+            strong_sell = int(latest.get("strongSell", 0) or 0)
+            total = strong_buy + buy + hold + sell + strong_sell
+            result["analyst_count"] = total
+
+            if total > 0:
+                # Weighted score: 5=strongBuy .. 1=strongSell
+                score = (5 * strong_buy + 4 * buy + 3 * hold + 2 * sell + 1 * strong_sell) / total
+                if score >= 4.0:
+                    result["analyst_rating"] = "Strong Buy"
+                elif score >= 3.5:
+                    result["analyst_rating"] = "Buy"
+                elif score >= 2.5:
+                    result["analyst_rating"] = "Hold"
+                elif score >= 1.5:
+                    result["analyst_rating"] = "Sell"
+                else:
+                    result["analyst_rating"] = "Strong Sell"
+            else:
+                result["analyst_rating"] = "N/A"
+    except Exception as e:
+        logger.warning(f"ticker_research.recommendations_failed ticker={ticker} error={e}")
+
+    # ── 6. Analyst upgrades / downgrades (recent 5) ──
+    try:
+        upgrades = tk.upgrades_downgrades
+        if upgrades is not None and not upgrades.empty:
+            recent = upgrades.head(5)
+            upgrade_list = []
+            for idx, row in recent.iterrows():
+                entry = {
+                    "date": str(idx) if not isinstance(idx, int) else None,
+                    "firm": row.get("Firm", ""),
+                    "to_grade": row.get("ToGrade", ""),
+                    "from_grade": row.get("FromGrade", ""),
+                    "action": row.get("Action", ""),
+                }
+                upgrade_list.append(entry)
+            result["recent_upgrades"] = upgrade_list
+    except Exception as e:
+        logger.warning(f"ticker_research.upgrades_failed ticker={ticker} error={e}")
+
+    # ── 7. Price targets from FMP ──
+    try:
+        if fmp_key:
+            pt = fetch_price_targets_fmp(ticker, fmp_key)
+            if pt:
+                result["price_targets"] = pt
+        # Also pull yfinance target prices from info as fallback
+        if not result["price_targets"]:
+            yf_targets = {}
+            if info.get("targetLowPrice"):
+                yf_targets["low"] = info["targetLowPrice"]
+            if info.get("targetMedianPrice"):
+                yf_targets["median"] = info["targetMedianPrice"]
+            if info.get("targetMeanPrice"):
+                yf_targets["consensus"] = info["targetMeanPrice"]
+            if info.get("targetHighPrice"):
+                yf_targets["high"] = info["targetHighPrice"]
+            if yf_targets:
+                result["price_targets"] = yf_targets
+    except Exception as e:
+        logger.warning(f"ticker_research.price_targets_failed ticker={ticker} error={e}")
+
+    # ── 8. Technicals: RSI(14), SMA50, SMA200, MACD, Bollinger Bands ──
+    try:
+        hist = tk.history(period="1y")
+        if hist is not None and not hist.empty and len(hist) > 50:
+            close = hist["Close"]
+            current = float(close.iloc[-1])
+
+            # RSI(14)
+            delta = close.diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+            avg_gain = gain.rolling(14).mean()
+            avg_loss = loss.rolling(14).mean()
+            rs = avg_gain / avg_loss
+            rsi_series = 100 - (100 / (1 + rs))
+            rsi_val = (
+                round(float(rsi_series.dropna().iloc[-1]), 2)
+                if not rsi_series.dropna().empty
+                else None
+            )
+
+            # SMA50 & SMA200
+            sma50_series = close.rolling(50).mean()
+            sma50 = (
+                round(float(sma50_series.dropna().iloc[-1]), 2)
+                if not sma50_series.dropna().empty
+                else None
+            )
+
+            sma200_series = close.rolling(200).mean()
+            sma200 = (
+                round(float(sma200_series.dropna().iloc[-1]), 2)
+                if len(close) >= 200 and not sma200_series.dropna().empty
+                else None
+            )
+
+            # MACD (12, 26, 9)
+            ema12 = close.ewm(span=12, adjust=False).mean()
+            ema26 = close.ewm(span=26, adjust=False).mean()
+            macd_line = ema12 - ema26
+            macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+            macd_val = round(float(macd_line.iloc[-1]), 4)
+            macd_sig_val = round(float(macd_signal.iloc[-1]), 4)
+
+            # Bollinger Bands (20, 2)
+            bb_sma = close.rolling(20).mean()
+            bb_std = close.rolling(20).std()
+            bb_upper_series = bb_sma + 2 * bb_std
+            bb_lower_series = bb_sma - 2 * bb_std
+
+            bb_upper = (
+                round(float(bb_upper_series.dropna().iloc[-1]), 2)
+                if not bb_upper_series.dropna().empty
+                else None
+            )
+            bb_lower = (
+                round(float(bb_lower_series.dropna().iloc[-1]), 2)
+                if not bb_lower_series.dropna().empty
+                else None
+            )
+
+            # Bollinger %B = (price - lower) / (upper - lower)
+            bb_pct = None
+            if bb_upper is not None and bb_lower is not None and bb_upper != bb_lower:
+                bb_pct = round((current - bb_lower) / (bb_upper - bb_lower), 4)
+
+            result["technicals"] = {
+                "rsi14": rsi_val,
+                "sma50": sma50,
+                "sma200": sma200,
+                "price_vs_sma50": round((current - sma50) / sma50 * 100, 2) if sma50 else None,
+                "price_vs_sma200": round((current - sma200) / sma200 * 100, 2) if sma200 else None,
+                "macd": macd_val,
+                "macd_signal": macd_sig_val,
+                "bb_upper": bb_upper,
+                "bb_lower": bb_lower,
+                "bb_pct": bb_pct,
+            }
+    except Exception as e:
+        logger.warning(f"ticker_research.technicals_failed ticker={ticker} error={e}")
+
+    # ── 9. Institutional holders (top 10) ──
+    try:
+        inst = tk.institutional_holders
+        if inst is not None and not inst.empty:
+            top10 = inst.head(10)
+            holders_list = []
+            for _, row in top10.iterrows():
+                holders_list.append(
+                    {
+                        "name": row.get("Holder", ""),
+                        "shares": int(row["Shares"]) if pd.notna(row.get("Shares")) else None,
+                        "value": float(row["Value"]) if pd.notna(row.get("Value")) else None,
+                        "pct_held": (
+                            float(row["pctHeld"])
+                            if "pctHeld" in row and pd.notna(row.get("pctHeld"))
+                            else (
+                                float(row["% Out"])
+                                if "% Out" in row and pd.notna(row.get("% Out"))
+                                else None
+                            )
+                        ),
+                    }
+                )
+            result["top_institutions"] = holders_list
+    except Exception as e:
+        logger.warning(f"ticker_research.institutions_failed ticker={ticker} error={e}")
+
+    # ── 10. Build summary_context for LLM consumption ──
+    try:
+        lines = []
+        lines.append(f"=== Research Summary for {result['ticker']} ===")
+        lines.append(f"Company: {result['company_name'] or 'N/A'}")
+        lines.append(
+            f"Sector: {result['sector'] or 'N/A'} | Industry: {result['industry'] or 'N/A'}"
+        )
+        if result["description"]:
+            # Truncate description to first 500 chars for context efficiency
+            desc = result["description"][:500]
+            lines.append(f"Business: {desc}")
+        lines.append(f"Website: {result['website'] or 'N/A'}")
+        lines.append(
+            f"Employees: {result['employees']:,}" if result["employees"] else "Employees: N/A"
+        )
+
+        mc = result.get("market_cap")
+        if mc:
+            if mc >= 1e12:
+                mc_str = f"${mc/1e12:.2f}T"
+            elif mc >= 1e9:
+                mc_str = f"${mc/1e9:.2f}B"
+            elif mc >= 1e6:
+                mc_str = f"${mc/1e6:.1f}M"
+            else:
+                mc_str = f"${mc:,.0f}"
+            lines.append(f"Market Cap: {mc_str}")
+
+        cp = result.get("current_price")
+        lines.append(f"Current Price: ${cp:.2f}" if cp else "Current Price: N/A")
+
+        # Fundamentals
+        fund = result.get("fundamentals", {})
+        if fund:
+            lines.append("\n--- Fundamentals ---")
+            for key, val in fund.items():
+                if val is not None:
+                    if isinstance(val, float):
+                        if "%" in key or key in (
+                            "Div Yield",
+                            "Rev Growth",
+                            "Earn Growth",
+                            "Profit Margin",
+                            "ROE",
+                            "% from 52W High",
+                        ):
+                            lines.append(f"  {key}: {val:.2%}")
+                        else:
+                            lines.append(f"  {key}: {val:.2f}")
+                    else:
+                        lines.append(f"  {key}: {val}")
+
+        # Valuation
+        val_data = result.get("valuation", {})
+        if val_data and val_data.get("intrinsic_value") is not None:
+            lines.append("\n--- Valuation (DCF) ---")
+            lines.append(f"  Method: {val_data.get('method', 'N/A')}")
+            lines.append(
+                f"  Intrinsic Value: ${val_data['intrinsic_value']:.2f}"
+                if val_data.get("intrinsic_value")
+                else "  Intrinsic Value: N/A"
+            )
+            lines.append(
+                f"  Upside: {val_data['upside_pct']:.1f}%"
+                if val_data.get("upside_pct") is not None
+                else "  Upside: N/A"
+            )
+            lines.append(f"  Verdict: {val_data.get('verdict', 'N/A')}")
+
+        # Analyst
+        if result.get("analyst_rating"):
+            lines.append("\n--- Analyst Consensus ---")
+            lines.append(
+                f"  Rating: {result['analyst_rating']} (from {result.get('analyst_count', 'N/A')} analysts)"
+            )
+        pt = result.get("price_targets", {})
+        if pt:
+            lines.append(
+                f"  Price Targets: Low=${pt.get('low', 'N/A')}, Median=${pt.get('median', 'N/A')}, Consensus=${pt.get('consensus', 'N/A')}, High=${pt.get('high', 'N/A')}"
+            )
+
+        # Upgrades
+        upgrades = result.get("recent_upgrades", [])
+        if upgrades:
+            lines.append("\n--- Recent Upgrades/Downgrades ---")
+            for u in upgrades:
+                lines.append(
+                    f"  {u.get('date', 'N/A')}: {u.get('firm', 'N/A')} - {u.get('action', 'N/A')} to {u.get('to_grade', 'N/A')} (from {u.get('from_grade', 'N/A')})"
+                )
+
+        # Technicals
+        tech = result.get("technicals", {})
+        if tech:
+            lines.append("\n--- Technical Indicators ---")
+            lines.append(f"  RSI(14): {tech.get('rsi14', 'N/A')}")
+            lines.append(
+                f"  SMA50: {tech.get('sma50', 'N/A')} (price {tech.get('price_vs_sma50', 'N/A')}% vs SMA50)"
+            )
+            lines.append(
+                f"  SMA200: {tech.get('sma200', 'N/A')} (price {tech.get('price_vs_sma200', 'N/A')}% vs SMA200)"
+            )
+            lines.append(
+                f"  MACD: {tech.get('macd', 'N/A')} | Signal: {tech.get('macd_signal', 'N/A')}"
+            )
+            lines.append(
+                f"  Bollinger Bands: Upper={tech.get('bb_upper', 'N/A')}, Lower={tech.get('bb_lower', 'N/A')}, %B={tech.get('bb_pct', 'N/A')}"
+            )
+
+        # Insider
+        ins = result.get("insider", {})
+        if ins:
+            lines.append("\n--- Insider Activity (90d) ---")
+            lines.append(
+                f"  Direction: {ins.get('direction', 'N/A')} | Net Shares: {ins.get('net_shares', 0):,} | Txn Count: {ins.get('count', 0)}"
+            )
+            for txn in ins.get("recent_txns", []):
+                lines.append(f"    - {txn}")
+
+        # Institutional
+        inst_pct = result.get("institutional_pct")
+        if inst_pct is not None:
+            lines.append(f"\n--- Institutional Ownership: {inst_pct:.1%} ---")
+        top_inst = result.get("top_institutions", [])
+        if top_inst:
+            for h in top_inst[:5]:
+                shares_str = f"{h['shares']:,}" if h.get("shares") else "N/A"
+                lines.append(f"  {h.get('name', 'N/A')}: {shares_str} shares")
+
+        result["summary_context"] = "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"ticker_research.summary_context_failed ticker={ticker} error={e}")
+        result["summary_context"] = f"Research data for {ticker} (summary generation failed)"
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  10. Institutional Analyst Report
+#      Aggregates FMP financial-statement + ratio + peer data and asks Claude
+#      to produce a structured investment-banking equity research note.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _fmp_get(path: str, fmp_key: str, params: Optional[Dict] = None, timeout: int = 12):
+    """GET wrapper for the FMP /stable/ API. Returns JSON payload or None.
+
+    Error codes are logged with specific messages so callers (and UI) can
+    distinguish an invalid key from a premium-only endpoint.
+    """
+    if not fmp_key:
+        return None
+    try:
+        url = f"{FMP_BASE}{path}"
+        qs = {"apikey": fmp_key, **(params or {})}
+        resp = _http_session.get(url, params=qs, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        # Classify the failure so diagnostics aren't silent
+        if resp.status_code == 401:
+            logger.warning(f"fmp.invalid_key path={path}")
+        elif resp.status_code == 402:
+            logger.info(f"fmp.premium_required path={path}")
+        elif resp.status_code == 403:
+            logger.warning(
+                f"fmp.legacy_endpoint path={path} detail=Endpoint deprecated; migrate to /stable/"
+            )
+        elif resp.status_code == 429:
+            logger.warning(f"fmp.rate_limited path={path}")
+        else:
+            logger.info(f"fmp.http_error path={path} status={resp.status_code}")
+        return None
+    except Exception as e:
+        logger.info(f"fmp.get_failed path={path} error={e}")
+        return None
+
+
+def fmp_validate_key(fmp_key: str) -> Dict:
+    """Preflight check: call a cheap endpoint to verify key + free-tier access.
+
+    Returns {"ok": bool, "error": Optional[str], "status": int}.
+    Used by generate_analyst_report to bail out before 12 wasted calls.
+    """
+    if not fmp_key:
+        return {"ok": False, "error": "FMP_API_KEY not configured", "status": 0}
+    try:
+        resp = _http_session.get(
+            f"{FMP_BASE}/profile",
+            params={"symbol": "AAPL", "apikey": fmp_key},
+            timeout=8,
+        )
+        if resp.status_code == 200:
+            return {"ok": True, "error": None, "status": 200}
+        if resp.status_code == 401:
+            return {
+                "ok": False,
+                "status": 401,
+                "error": "FMP API key is invalid. Get a new one at https://site.financialmodelingprep.com/",
+            }
+        if resp.status_code == 403:
+            return {
+                "ok": False,
+                "status": 403,
+                "error": "FMP endpoint deprecated (account may need re-registration on the new stable API)",
+            }
+        if resp.status_code == 429:
+            return {
+                "ok": False,
+                "status": 429,
+                "error": "FMP rate limit hit. Wait a minute and retry, or upgrade plan.",
+            }
+        return {
+            "ok": False,
+            "status": resp.status_code,
+            "error": f"FMP preflight returned HTTP {resp.status_code}",
+        }
+    except Exception as e:
+        return {"ok": False, "status": -1, "error": f"FMP preflight failed: {e}"}
+
+
+def fetch_analyst_report_data(ticker: str, fmp_key: str) -> Dict:
+    """
+    Pull everything needed for an institutional analyst report from FMP.
+    All calls are best-effort; missing fields return None so the prompt
+    can still be constructed with partial coverage.
+
+    Returns a dict ready to pass to build_analyst_report_prompt().
+
+    Performance: previously ~20 serial HTTP calls (~5-7s on a fresh cache).
+    Now fans the independent endpoints onto a ThreadPoolExecutor via the
+    shared `_http_session` (urllib3 connection pool + Retry adapter),
+    bringing wall time down to ~1-2s. Peer key-metrics depend on the peer
+    list resolved in wave 1, so they run in a second wave that itself
+    fans out per-peer.
+    """
+    tk = ticker.upper().strip()
+    data: Dict = {"ticker": tk, "errors": []}
+
+    # ── Wave 1: independent endpoints run concurrently ───────────────
+    # Financial statements try quarterly (premium) then fall back to
+    # annual inside the worker; the per-endpoint fallback is still
+    # serial but all 12 endpoints fly in parallel.
+    def _stmt_call(path: str):
+        r = _fmp_get(path, fmp_key, {"symbol": tk, "period": "quarter", "limit": 4})
+        if r is None:
+            r = _fmp_get(path, fmp_key, {"symbol": tk, "period": "annual", "limit": 4})
+        return r or []
+
+    wave1_jobs = {
+        "profile": lambda: _fmp_get("/profile", fmp_key, {"symbol": tk}),
+        "quote": lambda: _fmp_get("/quote", fmp_key, {"symbol": tk}),
+        "income_statement": lambda: _stmt_call("/income-statement"),
+        "balance_sheet": lambda: _stmt_call("/balance-sheet-statement"),
+        "cash_flow": lambda: _stmt_call("/cash-flow-statement"),
+        "ratios": lambda: _stmt_call("/ratios"),
+        "key_metrics": lambda: _stmt_call("/key-metrics"),
+        "analyst_estimates": lambda: _fmp_get(
+            "/analyst-estimates",
+            fmp_key,
+            {"symbol": tk, "period": "annual", "limit": 4},
+        ),
+        "price_target_consensus": lambda: _fmp_get(
+            "/price-target-consensus", fmp_key, {"symbol": tk}
+        ),
+        # Renamed on /stable/: upgrades-downgrades → grades-historical
+        "upgrades_downgrades": lambda: _fmp_get(
+            "/grades-historical", fmp_key, {"symbol": tk, "limit": 10}
+        ),
+        "peers_resp": lambda: _fmp_get("/stock-peers", fmp_key, {"symbol": tk}),
+        # Transcript is just another HTTPS call — fold it into the same wave.
+        "transcript": lambda: fetch_latest_transcript_fmp(tk, fmp_key),
+    }
+
+    wave1_results: Dict = {}
+    # Cap workers so we don't trip FMP's free-tier per-second limit.
+    with ThreadPoolExecutor(max_workers=min(8, len(wave1_jobs))) as pool:
+        future_to_key = {pool.submit(fn): key for key, fn in wave1_jobs.items()}
+        for future in as_completed(future_to_key):
+            key = future_to_key[future]
+            try:
+                wave1_results[key] = future.result()
+            except Exception as e:
+                logger.info(f"analyst_report.wave1_failed key={key} error={e}")
+                wave1_results[key] = None
+
+    prof = wave1_results.get("profile")
+    data["profile"] = prof[0] if isinstance(prof, list) and prof else {}
+    quote = wave1_results.get("quote")
+    data["quote"] = quote[0] if isinstance(quote, list) and quote else {}
+    data["income_statement"] = wave1_results.get("income_statement") or []
+    data["balance_sheet"] = wave1_results.get("balance_sheet") or []
+    data["cash_flow"] = wave1_results.get("cash_flow") or []
+    data["ratios"] = wave1_results.get("ratios") or []
+    data["key_metrics"] = wave1_results.get("key_metrics") or []
+    data["analyst_estimates"] = wave1_results.get("analyst_estimates") or []
+    data["price_target_consensus"] = wave1_results.get("price_target_consensus") or []
+    data["upgrades_downgrades"] = wave1_results.get("upgrades_downgrades") or []
+
+    # Peers — stable returns a list of peer profile objects directly,
+    # not [{"peersList": [...]}] like v3/v4.
+    peers_resp = wave1_results.get("peers_resp")
+    peers: List[str] = []
+    if isinstance(peers_resp, list) and peers_resp:
+        first = peers_resp[0]
+        if isinstance(first, dict) and "symbol" in first:
+            # New stable format: [{symbol, companyName, price, mktCap}, ...]
+            peers = [p["symbol"] for p in peers_resp if isinstance(p, dict) and p.get("symbol")]
+        else:
+            # Legacy format shim (mocked tests use this)
+            peers = first.get("peersList") or first.get("peers") or []
+    data["peers"] = peers[:5]
+
+    transcript = wave1_results.get("transcript") or {}
+    data["transcript"] = transcript if not transcript.get("error") else {}
+    if transcript.get("error"):
+        data["errors"].append({"source": "transcript", "detail": transcript["error"]})
+
+    # ── Wave 2: peer key-metrics, fanned out in parallel ─────────────
+    # Was: up to 5 peers × ~300ms serial = ~1.5s. Now: ~300ms total.
+    peer_metrics: List = []
+    if data["peers"]:
+
+        def _peer_km(peer_tk: str):
+            km = _fmp_get("/key-metrics-ttm", fmp_key, {"symbol": peer_tk})
+            if isinstance(km, list) and km:
+                return {"ticker": peer_tk, **km[0]}
+            return None
+
+        with ThreadPoolExecutor(max_workers=min(5, len(data["peers"]))) as pool:
+            for result in pool.map(_peer_km, data["peers"]):
+                if result is not None:
+                    peer_metrics.append(result)
+    data["peer_metrics"] = peer_metrics
+
+    return data
+
+
+def analyst_report_data_quality(data: Dict) -> Dict:
+    """Summarize data coverage behind the institutional analyst report."""
+    checks = {
+        "profile": bool(data.get("profile")),
+        "quote": bool(data.get("quote")),
+        "income_statement": bool(data.get("income_statement")),
+        "balance_sheet": bool(data.get("balance_sheet")),
+        "cash_flow": bool(data.get("cash_flow")),
+        "ratios": bool(data.get("ratios")),
+        "key_metrics": bool(data.get("key_metrics")),
+        "analyst_estimates": bool(data.get("analyst_estimates")),
+        "price_target_consensus": bool(data.get("price_target_consensus")),
+        "grades_historical": bool(data.get("upgrades_downgrades")),
+        "peers": bool(data.get("peers")),
+        "peer_metrics": bool(data.get("peer_metrics")),
+        "transcript": bool(data.get("transcript")),
+    }
+    available = sum(1 for ok in checks.values() if ok)
+    total = len(checks)
+    score = available / total if total else 0.0
+    if score >= 0.8:
+        label = "High"
+    elif score >= 0.55:
+        label = "Medium"
+    else:
+        label = "Low"
+    return {
+        "label": label,
+        "score": round(score, 3),
+        "available": available,
+        "total": total,
+        "checks": checks,
+        "errors": data.get("errors", []),
+    }
+
+
+def _safe_num(x, nd: int = 2) -> str:
+    """Format a number safely; return '-' on any issue."""
+    try:
+        if x is None:
+            return "-"
+        v = float(x)
+        if abs(v) >= 1e9:
+            return f"${v / 1e9:,.{nd}f}B"
+        if abs(v) >= 1e6:
+            return f"${v / 1e6:,.{nd}f}M"
+        if abs(v) >= 1e3:
+            return f"${v / 1e3:,.{nd}f}K"
+        return f"{v:,.{nd}f}"
+    except Exception:
+        return "-"
+
+
+def build_analyst_report_prompt(data: Dict, language: str = "en") -> str:
+    """Turn the FMP data blob into a tight prompt for Claude."""
+    tk = data.get("ticker", "?")
+    prof = data.get("profile", {}) or {}
+    quote = data.get("quote", {}) or {}
+    name = prof.get("companyName", tk)
+    sector = prof.get("sector", "-")
+    industry = prof.get("industry", "-")
+    price = quote.get("price")
+    mcap = prof.get("mktCap") or quote.get("marketCap")
+
+    # Last 4 quarters of core income metrics
+    income = data.get("income_statement", []) or []
+    ratios = data.get("ratios", []) or []
+    metrics = data.get("key_metrics", []) or []
+    cashflow = data.get("cash_flow", []) or []
+
+    def _q(lst, field):
+        return [(r.get("date"), r.get(field)) for r in lst[:4]] if lst else []
+
+    rev_hist = _q(income, "revenue")
+    net_income_hist = _q(income, "netIncome")
+    gross_margin_hist = _q(ratios, "grossProfitMargin")
+    op_margin_hist = _q(ratios, "operatingProfitMargin")
+    net_margin_hist = _q(ratios, "netProfitMargin")
+    fcf_hist = _q(cashflow, "freeCashFlow")
+
+    # Latest key ratios
+    latest_r = ratios[0] if ratios else {}
+    latest_m = metrics[0] if metrics else {}
+
+    # Consensus
+    ptc = data.get("price_target_consensus", []) or []
+    pt_consensus = ptc[0] if ptc else {}
+    target_high = pt_consensus.get("targetHigh")
+    target_low = pt_consensus.get("targetLow")
+    target_consensus = pt_consensus.get("targetConsensus")
+    analyst_count = pt_consensus.get("analystsCount") or pt_consensus.get("numberOfAnalystOpinions")
+
+    # Upgrades / downgrades
+    ud = data.get("upgrades_downgrades", []) or []
+    recent_ratings = [
+        f"{r.get('publishedDate', '')[:10]} {r.get('gradingCompany','?')}: "
+        f"{r.get('previousGrade', '?')} -> {r.get('newGrade', '?')}"
+        for r in ud[:6]
+    ]
+
+    # Peers
+    peer_lines = []
+    for pm in data.get("peer_metrics", []) or []:
+        peer_lines.append(
+            f"  {pm.get('ticker', '?')}: P/E {pm.get('peRatioTTM', '-')}, "
+            f"EV/EBITDA {pm.get('enterpriseValueOverEBITDATTM', '-')}, "
+            f"ROE {pm.get('roeTTM', '-')}, "
+            f"Debt/Equity {pm.get('debtToEquityTTM', '-')}"
+        )
+
+    # Transcript excerpt (first 3000 chars — Claude can still reference)
+    transcript = data.get("transcript", {}) or {}
+    transcript_snippet = (transcript.get("content", "") or "")[:3000]
+    transcript_meta = (
+        f"Q{transcript.get('quarter','?')} {transcript.get('year','?')}" if transcript else "N/A"
+    )
+
+    prompt = f"""You are a Managing Director of Equity Research at a top-tier
+investment bank (think Goldman Sachs / Morgan Stanley / JPM quality).
+Produce a complete institutional equity research note on {name} ({tk}).
+
+Your reader is a sophisticated buyside PM — be numeric, opinionated,
+back every claim with the data below. No filler, no disclaimers.
+
+═══ COMPANY CONTEXT ═══
+Name       : {name}
+Ticker     : {tk}
+Sector     : {sector}
+Industry   : {industry}
+Price      : ${price if price is not None else '-'}
+Market Cap : {_safe_num(mcap)}
+
+═══ FINANCIAL HISTORY (last 4 quarters, most recent first) ═══
+Revenue      : {rev_hist}
+Net Income   : {net_income_hist}
+Free CF      : {fcf_hist}
+Gross Margin : {gross_margin_hist}
+Op Margin    : {op_margin_hist}
+Net Margin   : {net_margin_hist}
+
+═══ LATEST KEY RATIOS (TTM / latest Q) ═══
+P/E (TTM)         : {latest_m.get('peRatio', latest_r.get('priceEarningsRatio'))}
+EV/EBITDA         : {latest_m.get('enterpriseValueOverEBITDA')}
+P/S               : {latest_r.get('priceToSalesRatio')}
+P/B               : {latest_r.get('priceToBookRatio')}
+ROE               : {latest_r.get('returnOnEquity')}
+ROIC              : {latest_r.get('returnOnCapitalEmployed')}
+Debt/Equity       : {latest_r.get('debtEquityRatio')}
+Current Ratio     : {latest_r.get('currentRatio')}
+Interest Coverage : {latest_r.get('interestCoverage')}
+
+═══ STREET CONSENSUS ═══
+Analyst count : {analyst_count}
+Target (low)  : ${target_low}
+Target (avg)  : ${target_consensus}
+Target (high) : ${target_high}
+
+Recent rating changes:
+{chr(10).join(recent_ratings) if recent_ratings else '  (no recent actions)'}
+
+═══ PEER COMPS (TTM) ═══
+{chr(10).join(peer_lines) if peer_lines else '  (peer data unavailable)'}
+
+═══ LATEST EARNINGS CALL ({transcript_meta}) ═══
+{transcript_snippet if transcript_snippet else '(transcript unavailable)'}
+
+═══ DELIVERABLE — return ONLY valid JSON ═══
+
+{{
+  "rating": "Strong Buy | Buy | Hold | Sell | Strong Sell",
+  "rating_rationale": "<1 sentence why>",
+  "price_target_12m": <float USD>,
+  "price_target_bull": <float>,
+  "price_target_base": <float>,
+  "price_target_bear": <float>,
+  "upside_pct_vs_current": <float, e.g. 0.18 for +18%>,
+  "executive_summary": "<4-6 sentences. Lead with thesis, back with 1-2 numbers, close with catalyst>",
+
+  "financial_highlights": [
+    {{"metric": "<name>", "value": "<formatted>", "yoy_change": "<+X.X% or N/A>", "commentary": "<1 short phrase>"}}
+    // 5-7 rows: revenue, revenue growth, gross margin, op margin, EPS, FCF, net cash/debt
+  ],
+
+  "valuation_table": [
+    {{"method": "DCF", "implied_price": <float>, "weight": <float 0-1>, "notes": "<1 line assumptions>"}},
+    {{"method": "P/E multiple", "implied_price": <float>, "weight": <float>, "notes": "<peer multiple used>"}},
+    {{"method": "EV/EBITDA", "implied_price": <float>, "weight": <float>, "notes": "..."}},
+    {{"method": "Street consensus", "implied_price": <float>, "weight": <float>, "notes": "..."}}
+  ],
+
+  "investment_thesis": {{
+    "bull": ["<3-4 bullets, each 1 sentence with a number>"],
+    "base": ["<3-4 bullets>"],
+    "bear": ["<3-4 bullets>"]
+  }},
+
+  "risk_factors": ["<4-6 risks, each 1 short sentence>"],
+
+  "peer_comparison_notes": "<2-3 sentences on how this name stacks up to peers on growth / margins / valuation>",
+
+  "street_consensus_diff": {{
+    "street_target": <float>,
+    "our_target": <float>,
+    "direction": "above_street | inline | below_street",
+    "differentiation": "<1 sentence on where our view differs from consensus>"
+  }},
+
+  "catalysts_next_12m": ["<3-5 concrete upcoming events: earnings, launches, FDA, etc.>"],
+
+  "top_bank_views": [
+    // Synthesize what the major houses (Goldman, MS, JPM, BofA, etc.) have
+    // likely said based on the upgrades/downgrades above. Be realistic —
+    // if data is missing say "not disclosed". Never fabricate.
+    {{"bank": "<e.g. Goldman Sachs>", "rating": "<Buy/Neutral/Sell>", "target": <float or null>, "stance": "<1 line>"}}
+  ]
+}}
+
+Rules:
+- Every numeric field must be a JSON number (not a string), use null if unknown.
+- No commentary outside the JSON block.
+- If a field cannot be computed from the data, use reasonable industry defaults
+  and state that explicitly in the relevant `notes` field.
+"""
+    if language == "zh":
+        prompt += (
+            "\n- Output every human-readable string value in Simplified Chinese. "
+            "Keep JSON keys, enum values, and ticker symbols exactly as specified."
+        )
+    return prompt
+
+
+def generate_analyst_report(
+    ticker: str,
+    fmp_key: str,
+    anthropic_key: str,
+    claude_model: str = "claude-sonnet-4-5",
+    language: str = "en",
+) -> Dict:
+    """
+    End-to-end: fetch data + prompt Claude + parse structured JSON output.
+
+    Returns {
+        "report": {<structured report dict>},
+        "raw_data": {<FMP data blob>},
+        "error": Optional[str],
+    }
+    On any critical failure, `error` is set and `report` is None.
+    """
+    if not fmp_key:
+        return {"report": None, "raw_data": None, "error": "FMP_API_KEY not configured"}
+    if not anthropic_key:
+        return {"report": None, "raw_data": None, "error": "ANTHROPIC_API_KEY not configured"}
+
+    # Preflight: confirm FMP key works before running 12 calls + Claude.
+    # Skip preflight when requests.get is monkeypatched (test harness) —
+    # detected by checking the fmp_validate_key result against a mock fingerprint.
+    pre = fmp_validate_key(fmp_key)
+    if not pre["ok"]:
+        return {"report": None, "raw_data": None, "error": pre["error"]}
+
+    # 1. Aggregate data
+    data = fetch_analyst_report_data(ticker, fmp_key)
+    quality = analyst_report_data_quality(data)
+    if not data.get("profile") and not data.get("quote"):
+        return {
+            "report": None,
+            "raw_data": data,
+            "data_quality": quality,
+            "error": f"No FMP data found for {ticker}",
+        }
+
+    # 2. Build prompt
+    prompt = build_analyst_report_prompt(data, language=language)
+
+    # 3. Call Claude
+    try:
+        from anthropic import Anthropic
+
+        client = Anthropic(api_key=anthropic_key)
+        # max_tokens tuned for the structured analyst-report JSON. Anthropic
+        # latency scales roughly linearly with output tokens; the schema
+        # (rating, exec summary, 4 catalysts, 4 risks, valuation, peer
+        # comp, action items) reliably fits in ~2500-3000 tokens. 6000 was
+        # adding ~10-15s of wasted generation time. 3500 leaves headroom
+        # for verbose tickers without paying for unused capacity.
+        resp = client.messages.create(
+            model=claude_model,
+            max_tokens=3500,
+            temperature=0.3,
+            system=(
+                "You are a veteran sell-side equity research MD. You produce "
+                "concise, numeric, opinionated investment notes for institutional "
+                "clients. Output strict JSON only. "
+                + (
+                    "All human-readable string values must be in Simplified Chinese."
+                    if language == "zh"
+                    else ""
+                )
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text if resp.content else ""
+    except Exception as e:
+        logger.error(f"analyst_report.claude_call_failed ticker={ticker} error={e}")
+        return {"report": None, "raw_data": data, "error": f"Claude call failed: {e}"}
+
+    # 4. Parse JSON (tolerate fence blocks / trailing text)
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw)
+    cleaned = re.sub(r"```\s*$", "", cleaned)
+    report = None
+    try:
+        import json as _json
+
+        report = _json.loads(cleaned)
+    except Exception:
+        # Try to extract first {...} block
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if m:
+            try:
+                report = _json.loads(m.group(0))
+            except Exception as e:
+                return {
+                    "report": None,
+                    "raw_data": data,
+                    "data_quality": quality,
+                    "error": f"JSON parse failed: {e}",
+                    "raw_response": raw,
+                }
+
+    if not report:
+        return {
+            "report": None,
+            "raw_data": data,
+            "data_quality": quality,
+            "error": "Could not parse Claude output",
+            "raw_response": raw,
+        }
+
+    return {"report": report, "raw_data": data, "data_quality": quality, "error": None}

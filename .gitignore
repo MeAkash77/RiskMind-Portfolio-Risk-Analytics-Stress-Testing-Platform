@@ -1,0 +1,90 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+env/
+.env
+
+# Root-level JavaScript tooling cache (the Next app has its own ignore too)
+/node_modules/
+
+# Environment / secrets
+.env
+*.env
+.anthropic_key
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Supabase CLI local state
+supabase/.temp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Output files
+portfolio_risk_report.xlsx
+
+# Test + coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# Dev tool caches
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+logs/
+*.log
+
+# Claude Code workspace (local working docs, not for public repo)
+.claude/
+CLAUDE.md
+docs/session-*.md
+docs/interview/
+
+# AWS CDK build artifacts (large; can be regenerated with `cdk synth`)
+infra/cdk.out/
+**/cdk.out/
+missfont.log
+
+# Marketing media — keep scripts (.md, .txt) but exclude rendered audio/video
+docs/marketing/**/*.wav
+docs/marketing/**/*.m4a
+docs/marketing/**/*.mp3
+docs/marketing/**/*.mp4
+docs/marketing/**/*.webm
+docs/marketing/**/*.mov
+docs/marketing/**/*.png
+docs/marketing/**/*.jpg
+docs/marketing/**/*.jpeg
+docs/marketing/youtube/rendered/**/*.html
+
+# Equity PDF: CJK font binaries dropped in for production. README
+# explains how to seed this directory on the EC2 host.
+fonts/*.ttf
+fonts/*.ttc
+fonts/*.otf
+
+# Local-only compose port overrides (docs/user/SETUP.md §5) — never deploy
+compose.override.yml
+
+# Local export artifacts (marketing images, recordings) — never commit
+exports/
+
+# MLflow local file store (training-side experiment tracking)
+mlruns/
+
+# Box-local marker: hash of the last Caddyfile deploy-ec2.sh successfully applied
+.caddy-applied

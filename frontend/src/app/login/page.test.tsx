@@ -1,0 +1,140 @@
+/**
+ * `/login` page contract.
+ *
+ * Branches asserted:
+ *   1. Supabase env unset → the form is hidden, setup notice shown.
+ *   2. signIn() resolves → we navigate to Today (/).
+ *   3. signIn() rejects → the error message renders in an alert.
+ *   4. Google OAuth starts from the primary CTA.
+ */
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+const replaceMock = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ replace: replaceMock, push: vi.fn() }),
+}));
+
+const useAuthMock = vi.fn();
+vi.mock("@/lib/auth-context", () => ({
+  useAuth: () => useAuthMock(),
+}));
+
+import LoginPage from "./page";
+
+afterEach(() => {
+  vi.clearAllMocks();
+  window.history.replaceState({}, "", "/login");
+  window.sessionStorage.clear();
+});
+
+describe("LoginPage", () => {
+  it("renders the setup notice when Supabase env is missing", () => {
+    useAuthMock.mockReturnValue({
+      user: null,
+      accessToken: null,
+      loading: false,
+      configured: false,
+      signIn: vi.fn(),
+      signInWithGoogle: vi.fn(),
+      signOut: vi.fn(),
+    });
+
+    render(<LoginPage />);
+    expect(
+      screen.getByText(/sign-in isn.t available on this preview build/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /sign in/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("calls signIn and redirects to Today on success", async () => {
+    const signIn = vi.fn().mockResolvedValue(undefined);
+    useAuthMock.mockReturnValue({
+      user: null,
+      accessToken: null,
+      loading: false,
+      configured: true,
+      signIn,
+      signInWithGoogle: vi.fn(),
+      signOut: vi.fn(),
+    });
+
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await user.type(screen.getByLabelText(/email/i), "owner@mindmarket.test");
+    await user.type(screen.getByLabelText(/password/i), "hunter2");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    expect(signIn).toHaveBeenCalledWith("owner@mindmarket.test", "hunter2");
+    expect(replaceMock).toHaveBeenCalledWith("/");
+  });
+
+  it("surfaces the error message when signIn rejects", async () => {
+    const signIn = vi.fn().mockRejectedValue(new Error("Invalid login credentials"));
+    useAuthMock.mockReturnValue({
+      user: null,
+      accessToken: null,
+      loading: false,
+      configured: true,
+      signIn,
+      signInWithGoogle: vi.fn(),
+      signOut: vi.fn(),
+    });
+
+    const user = userEvent.setup();
+    render(<LoginPage />);
+    await user.type(screen.getByLabelText(/email/i), "x@y.com");
+    await user.type(screen.getByLabelText(/password/i), "wrong");
+    await user.click(screen.getByRole("button", { name: /sign in/i }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/invalid login credentials/i);
+    expect(replaceMock).not.toHaveBeenCalled();
+  });
+
+  it("starts Google OAuth from the primary CTA", async () => {
+    const signInWithGoogle = vi.fn().mockResolvedValue(undefined);
+    useAuthMock.mockReturnValue({
+      user: null,
+      accessToken: null,
+      loading: false,
+      configured: true,
+      signIn: vi.fn(),
+      signInWithGoogle,
+      signOut: vi.fn(),
+    });
+
+    const user = userEvent.setup();
+    render(<LoginPage />);
+    await user.click(screen.getByRole("button", { name: /continue with google/i }));
+
+    expect(signInWithGoogle).toHaveBeenCalledWith("/");
+  });
+
+  it("continues a safe portfolio handoff after email confirmation", async () => {
+    window.history.replaceState({}, "", "/login?next=%2Fportfolios%2Fnew");
+    const signIn = vi.fn().mockResolvedValue(undefined);
+    useAuthMock.mockReturnValue({
+      user: null,
+      accessToken: null,
+      loading: false,
+      configured: true,
+      signIn,
+      signInWithGoogle: vi.fn(),
+      signOut: vi.fn(),
+    });
+
+    render(<LoginPage />);
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText(/email/i), "owner@mindmarket.test");
+    await user.type(screen.getByLabelText(/password/i), "hunter2");
+    await user.click(screen.getByRole("button", { name: /^sign in$/i }));
+
+    expect(replaceMock).toHaveBeenCalledWith("/portfolios/new");
+  });
+});

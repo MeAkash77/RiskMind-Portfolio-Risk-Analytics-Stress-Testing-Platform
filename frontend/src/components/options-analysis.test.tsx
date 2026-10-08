@@ -1,0 +1,266 @@
+/**
+ * OptionsAnalysis: renders Greeks + payoff for the active book's option
+ * contracts (POST /options/analyze), and renders nothing when there are none.
+ * optionContractsFromHoldings extracts only the option entries from a holdings
+ * dict.
+ */
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { renderWithQuery } from "@/test-utils";
+
+vi.mock("@/lib/auth-context", () => ({
+  useAuth: () => ({ user: { id: "u-1" }, accessToken: "jwt", configured: true, loading: false }),
+}));
+// recharts needs a sized parent jsdom lacks — stub the payoff chart.
+vi.mock("recharts", () => {
+  const Pass = ({ children }: { children?: React.ReactNode }) => <div>{children}</div>;
+  return {
+    ResponsiveContainer: Pass,
+    LineChart: Pass,
+    Line: () => null,
+    XAxis: () => null,
+    YAxis: () => null,
+    CartesianGrid: () => null,
+    Tooltip: () => null,
+    ReferenceLine: () => null,
+  };
+});
+
+import { OptionsAnalysis } from "./options-analysis";
+import { optionContractsFromHoldings, type OptionContract } from "@/lib/queries";
+
+const CONTRACT: OptionContract = {
+  underlying: "AAPL",
+  option_type: "call",
+  strike: 150,
+  expiry: "2027-01-15",
+  quantity: 2,
+  avg_premium: 5,
+  contract_multiplier: 100,
+};
+
+const LEG = {
+  contract_symbol: "AAPL270115C00150000",
+  underlying: "AAPL",
+  option_type: "call",
+  strike: 150,
+  expiry: "2027-01-15",
+  quantity: 2,
+  contract_multiplier: 100,
+  days_to_expiry: 200,
+  spot: 180,
+  mark: 40,
+  iv: 0.3,
+  greeks: { delta: 0.7, gamma: 0.01, theta: -0.05, vega: 0.2, rho: 0.1 },
+  delta_notional: 25200,
+  market_value: 8000,
+  cost_basis: 1000,
+  unrealized_pnl: 7000,
+  break_even: 155,
+  moneyness: "ITM",
+  payoff: [{ price: 150, pnl: -1000 }, { price: 200, pnl: 9000 }],
+  source: "stale_eod",
+  warnings: [],
+};
+
+function analyzeJson() {
+  return new Response(
+    JSON.stringify({
+      data: {
+        results: [LEG],
+        strategies: [
+          {
+            underlying: "AAPL",
+            expiry: "2027-01-15",
+            name: "Long call",
+            leg_count: 1,
+            net_debit: 1000,
+            premium_basis: "entry",
+            net_pnl: 7000,
+            max_loss: 1000,
+            max_gain: null, // unbounded upside
+            break_evens: [155],
+            net_greeks: { delta: 140, gamma: 2, theta: -10, vega: 40 },
+            payoff: [{ price: 150, pnl: -1000 }, { price: 200, pnl: 9000 }],
+            legs: [LEG],
+          },
+        ],
+        totals: {
+          net_delta: 140,
+          net_gamma: 2,
+          net_theta: -10,
+          net_vega: 40,
+          delta_notional: 25200,
+          market_value: 8000,
+          unrealized_pnl: 7000,
+          contracts: 1,
+        },
+        exposure: {
+          net_delta: 140,
+          gross_delta: 140,
+          net_gamma: 2,
+          net_theta: -10,
+          net_vega: 40,
+          option_market_value: 8000,
+          option_notional: 25200,
+          short_collateral_estimate: 0,
+          contracts: 1,
+          short_contracts: 0,
+          expiry_ladder: [
+            { expiry: "2027-01-15", days_to_expiry: 200, contracts: 1, net_delta: 140, net_notional: 25200 },
+          ],
+          underlying_exposure: [
+            { underlying: "AAPL", contracts: 1, net_delta: 140, net_notional: 25200, equity_shares: null },
+          ],
+          flags: [{ code: "high_single_underlying", severity: "watch", detail: "Concentrated in AAPL." }],
+        },
+        scenarios: {
+          grid: [{ underlying_shock: -0.2, iv_shock: 0.1, horizon: 0, total_pnl: -500 }],
+          top_positions: [{ underlying: "AAPL", option_type: "call", strike: 150, quantity: 2, pnl: -500 }],
+          stress_cell: { underlying_shock: -0.2, iv_shock: 0.1, horizon: 0 },
+          underlying_shocks: [-0.2],
+          iv_shocks: [0.1],
+          horizons: [0, 7, 30, "expiry"],
+          repriced: 1,
+          skipped: [],
+          as_of: "2026-06-13",
+        },
+        as_of: "2026-06-13",
+        warnings: [],
+      },
+      error: null,
+      meta: { request_id: "r" },
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+function explainJson() {
+  return new Response(
+    JSON.stringify({
+      data: {
+        severity: "elevated",
+        headline: "Elevated option risk — Concentrated in AAPL.",
+        summary_bullets: ["Most exposure is one name."],
+        suggested_actions: [
+          { title: "Inspect concentration", reason: "Concentrated in AAPL.", next_step: "Size accordingly." },
+        ],
+        caveats: ["Educational, not financial advice."],
+        ai_generated: false,
+      },
+      error: null,
+      meta: { request_id: "r" },
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+// Route fetch by URL: /explain vs /analyze (which now carries scenarios).
+function mockFetchByUrl() {
+  vi.spyOn(globalThis, "fetch").mockImplementation((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/explain")) return Promise.resolve(explainJson());
+    return Promise.resolve(analyzeJson());
+  });
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+describe("optionContractsFromHoldings", () => {
+  it("extracts only option entries, ignoring equities", () => {
+    const contracts = optionContractsFromHoldings({
+      AAPL: { shares: 10, avg_cost: 180 },
+      AAPL270115C00150000: {
+        shares: 2,
+        avg_cost: 5,
+        asset_type: "option",
+        option_type: "call",
+        underlying: "AAPL",
+        strike: 150,
+        expiry: "2027-01-15",
+      },
+    });
+    expect(contracts).toHaveLength(1);
+    expect(contracts[0]).toMatchObject({ underlying: "AAPL", strike: 150, quantity: 2, avg_premium: 5 });
+  });
+
+  it("drops option entries missing required contract fields", () => {
+    const contracts = optionContractsFromHoldings({
+      BAD: { shares: 1, asset_type: "option", option_type: "put", underlying: "SPY" }, // no strike/expiry
+    });
+    expect(contracts).toHaveLength(0);
+  });
+
+  it("normalizes broker sell verbs and never double-negates legacy short shares", () => {
+    const contracts = optionContractsFromHoldings({
+      GOOGL270115C00400000: {
+        shares: -1,
+        asset_type: "option",
+        option_type: "call",
+        option_side: "Sell",
+        underlying: "GOOGL",
+        strike: 400,
+        expiry: "2027-01-15",
+      },
+    });
+    expect(contracts[0]).toMatchObject({ quantity: -1, side_confirmed: true });
+  });
+
+  it("flags a positive legacy option with no side instead of silently trusting it", () => {
+    const contracts = optionContractsFromHoldings({
+      ORCL270115C00200000: {
+        shares: 1,
+        asset_type: "option",
+        option_type: "call",
+        underlying: "ORCL",
+        strike: 200,
+        expiry: "2027-01-15",
+      },
+    });
+    expect(contracts[0]).toMatchObject({ quantity: 1, side_confirmed: false });
+  });
+
+  it("drops zero or invalid quantities instead of inventing one contract", () => {
+    const base = {
+      asset_type: "option",
+      option_type: "call",
+      underlying: "ORCL",
+      strike: 200,
+      expiry: "2027-01-15",
+    };
+    expect(optionContractsFromHoldings({ ZERO: { ...base, shares: 0 } })).toEqual([]);
+    expect(optionContractsFromHoldings({ BAD: { ...base, shares: "not-a-number" } })).toEqual([]);
+  });
+});
+
+describe("OptionsAnalysis", () => {
+  it("renders nothing when there are no option contracts", () => {
+    const { container } = renderWithQuery(<OptionsAnalysis contracts={[]} />);
+    expect(container.textContent).not.toContain("Options");
+  });
+
+  it("renders exposure, flags, stress grid + the netted strategy once analytics load", async () => {
+    const user = userEvent.setup();
+    mockFetchByUrl();
+    renderWithQuery(<OptionsAnalysis contracts={[CONTRACT]} />);
+    // exposure summary
+    expect(await screen.findByText("Portfolio option exposure", { exact: false })).toBeInTheDocument();
+    // risk flag surfaced
+    expect(await screen.findByText("Concentrated in AAPL.")).toBeInTheDocument();
+    // stress grid repriced
+    expect(await screen.findByText("Stress grid", { exact: false })).toBeInTheDocument();
+
+    // NEW: the netted strategy card (name + bounded max loss). Legs are
+    // collapsed by default — the scary per-leg numbers don't shout.
+    expect(await screen.findByText("Long call")).toBeInTheDocument();
+    expect(screen.getByText("Combined P&L at expiry", { exact: false })).toBeInTheDocument();
+    // delta lives inside the leg, hidden until expanded.
+    expect(screen.queryByText("0.700")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /show 1 leg/i }));
+    expect(await screen.findByText("0.700")).toBeInTheDocument();
+    // honest price-quality label (yfinance is delayed/EOD).
+    expect(screen.getByText(/delayed \/ eod/i)).toBeInTheDocument();
+  });
+});
