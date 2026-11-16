@@ -1,8 +1,8 @@
 {
   "model_version": "regime-v1.1.0",
-  "trained_at": "2026-11-09T15:58:44.623139+00:00",
+  "trained_at": "2026-11-16T15:32:48.779919+00:00",
   "sklearn_version": "1.8.0",
-  "git_sha": "17aa16e78998ef39bb37375e75f5fc744a4bb78d",
+  "git_sha": "b01c44cc64504340044e9888d6f052e066b432f3",
   "estimator": "HistGradientBoostingClassifier",
   "config": {
     "model_version": "regime-v1.1.0",
@@ -58,69 +58,69 @@
     ]
   },
   "training_window": {
-    "start": "2012-10-15",
-    "end": "2026-10-26",
+    "start": "2012-10-22",
+    "end": "2026-11-02",
     "rows": 3527
   },
   "class_distribution": {
-    "risk_on": 1882,
-    "neutral": 913,
+    "risk_on": 1881,
+    "neutral": 909,
     "volatile": 550,
-    "stress": 182
+    "stress": 187
   },
   "metrics": {
-    "cv_macro_f1_mean": 0.2807,
-    "cv_accuracy_mean": 0.4429,
-    "holdout_accuracy": 0.5397,
-    "holdout_macro_f1": 0.3698,
-    "elevated_risk_auc": 0.7315,
+    "cv_macro_f1_mean": 0.3008,
+    "cv_accuracy_mean": 0.4514,
+    "holdout_accuracy": 0.5283,
+    "holdout_macro_f1": 0.369,
+    "elevated_risk_auc": 0.7309,
     "baseline_majority_class": "risk_on",
-    "baseline_accuracy": 0.5198,
+    "baseline_accuracy": 0.5127,
     "per_class": {
       "risk_on": {
-        "precision": 0.616,
-        "recall": 0.847,
-        "f1-score": 0.713
+        "precision": 0.605,
+        "recall": 0.818,
+        "f1-score": 0.696
       },
       "neutral": {
-        "precision": 0.43,
-        "recall": 0.189,
-        "f1-score": 0.263
+        "precision": 0.421,
+        "recall": 0.21,
+        "f1-score": 0.28
       },
       "volatile": {
-        "precision": 0.256,
-        "recall": 0.25,
-        "f1-score": 0.253
+        "precision": 0.268,
+        "recall": 0.275,
+        "f1-score": 0.272
       },
       "stress": {
-        "precision": 0.25,
-        "recall": 0.25,
-        "f1-score": 0.25
+        "precision": 0.286,
+        "recall": 0.19,
+        "f1-score": 0.229
       }
     },
     "confusion_matrix": [
       [
-        311,
-        40,
-        14,
-        2
+        296,
+        46,
+        20,
+        0
       ],
       [
         159,
-        46,
-        34,
+        51,
+        29,
         4
       ],
       [
-        35,
-        19,
-        20,
+        34,
+        18,
+        22,
         6
       ],
       [
         0,
-        2,
-        10,
+        6,
+        11,
         4
       ]
     ],
@@ -133,38 +133,38 @@
     "holdout_size": 706
   },
   "feature_importances": {
-    "vix_level": 0.18116,
-    "vol_63d": 0.15352,
-    "yield_slope": 0.07983,
-    "golden_cross": 0.07858,
-    "vol_21d": 0.07023,
-    "vol_ratio": 0.06853,
-    "mom_60d": 0.05808,
-    "drawdown": 0.04587,
-    "trend_sma50": 0.03993,
-    "qqq_trend": 0.03325,
-    "vix_change_5d": 0.03252,
-    "qqq_spy_spread": 0.03139,
-    "mom_20d": 0.02722,
-    "vix_term": 0.02556,
-    "trend_sma200": 0.01374
+    "vix_level": 0.1899,
+    "vol_63d": 0.15129,
+    "yield_slope": 0.08475,
+    "vol_ratio": 0.08162,
+    "golden_cross": 0.07963,
+    "mom_60d": 0.07825,
+    "vol_21d": 0.06788,
+    "qqq_trend": 0.04637,
+    "qqq_spy_spread": 0.04371,
+    "drawdown": 0.04201,
+    "vix_change_5d": 0.03997,
+    "trend_sma50": 0.03577,
+    "mom_20d": 0.03226,
+    "trend_sma200": 0.0243,
+    "vix_term": 0.02417
   },
   "feature_medians": {
-    "trend_sma200": 0.067338,
-    "trend_sma50": 0.018982,
+    "trend_sma200": 0.067232,
+    "trend_sma50": 0.018972,
     "golden_cross": 0.049258,
     "mom_20d": 0.016201,
-    "mom_60d": 0.040907,
+    "mom_60d": 0.040743,
     "vol_21d": 0.118881,
-    "vol_63d": 0.124417,
-    "vol_ratio": 0.826826,
+    "vol_63d": 0.124416,
+    "vol_ratio": 0.827295,
     "drawdown": -0.014094,
     "vix_level": 16.049999,
     "vix_change_5d": -0.17,
-    "vix_term": 0.88175,
+    "vix_term": 0.881733,
     "qqq_trend": 0.086558,
     "qqq_spy_spread": 0.004247,
-    "yield_slope": 1.091
+    "yield_slope": 1.085
   },
   "data_coverage": {
     "sources_present": [
@@ -176,8 +176,8 @@
       "vix3m"
     ],
     "sources_missing": [],
-    "spy_start": "2011-10-14",
-    "spy_end": "2026-11-09",
+    "spy_start": "2011-10-21",
+    "spy_end": "2026-11-16",
     "observations": 3789
   }
 }
